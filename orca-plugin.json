@@ -1,0 +1,237 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stablyai/orca/main/docs/schemas/plugins/orca-plugin.v2.schema.json",
+  "manifestVersion": 2,
+  "id": "task-bridge",
+  "name": "Task Bridge (Linear, Jira & Notion)",
+  "version": "0.1.0",
+  "author": {
+    "name": "Carlos Manuel Díaz",
+    "url": "https://github.com/CarlosManuelDiaz"
+  },
+  "repository": "https://github.com/CarlosManuelDiaz/task-bridge",
+  "description": "Unified issue-to-worktree dispatcher for Linear, Jira, and Notion. Hydrates subtasks and Acceptance Criteria, auto-routes multi-repo workspaces via ticketPrefixes, reads CLAUDE.md/AGENTS.md guidelines, enforces Plan-First approval via tool hooks, monitors your In-Flight Fleet with Verify AC, In Review/Done transitions, comment feedback, and one-click Fleet/worktree cleanup.",
+  "license": "MIT",
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "task-bridge",
+        "title": "Task Bridge",
+        "icon": "layers",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "commands": [
+      {
+        "id": "taskBridge.sync",
+        "title": "Task Bridge: Sync Tickets (Linear, Jira & Notion)",
+        "when": "global"
+      },
+      {
+        "id": "taskBridge.completeActive",
+        "title": "Task Bridge: Move Active Workspace Ticket to In Review",
+        "when": "workspace"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "taskBridge.sync",
+        "key": "Mod+Shift+Y"
+      }
+    ],
+    "events": [
+      {
+        "on": "workspace.changed"
+      },
+      {
+        "on": "agent.status.changed"
+      }
+    ],
+    "hooks": [
+      {
+        "event": "agent.prompt.before",
+        "onError": "pass"
+      },
+      {
+        "event": "agent.tool.before",
+        "onError": "pass"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "active-ticket",
+        "text": "No linked ticket",
+        "icon": "layers",
+        "tone": "neutral",
+        "tooltip": "Task Bridge: Active workspace ticket",
+        "command": "taskBridge.sync"
+      }
+    ],
+    "settings": [
+      {
+        "key": "defaultAgent",
+        "title": "Default Coding Agent",
+        "description": "Agent CLI to launch when dispatching a ticket into a worktree.",
+        "type": "string",
+        "default": "claude",
+        "enum": ["antigravity", "claude", "codex", "gemini", "cursor"],
+        "enumLabels": ["Antigravity (agy)", "Claude Code", "Codex", "Gemini CLI", "Cursor CLI"]
+      },
+      {
+        "key": "branchPrefixMode",
+        "title": "Branch Prefix Mode",
+        "description": "Auto-select prefix by ticket kind or force one type prefix.",
+        "type": "string",
+        "default": "auto",
+        "enum": ["auto", "feat", "fix", "chore"],
+        "enumLabels": [
+          "Auto (map feature/bug/chore to configured prefixes)",
+          "Always use Feature prefix",
+          "Always use Bug prefix",
+          "Always use Chore prefix"
+        ]
+      },
+      {
+        "key": "branchTemplate",
+        "title": "Branch Naming Template",
+        "description": "Template for Git branches. Placeholders: {prefix}, {key}, {KEY}, {slug}, {project}, {PROJECT}, {type}.",
+        "type": "string",
+        "default": "{prefix}/{key}-{slug}",
+        "placeholder": "{prefix}/{key}-{slug} or feature/{KEY}-{slug}"
+      },
+      {
+        "key": "featurePrefix",
+        "title": "Feature Branch Prefix",
+        "description": "Prefix for feature/story tickets (e.g. feat, feature, story).",
+        "type": "string",
+        "default": "feat"
+      },
+      {
+        "key": "bugPrefix",
+        "title": "Bug Branch Prefix",
+        "description": "Prefix for bug/defect tickets (e.g. fix, bugfix, hotfix).",
+        "type": "string",
+        "default": "fix"
+      },
+      {
+        "key": "chorePrefix",
+        "title": "Chore Branch Prefix",
+        "description": "Prefix for chore/maintenance tickets (e.g. chore, task, refactor).",
+        "type": "string",
+        "default": "chore"
+      },
+      {
+        "key": "requirePlanApproval",
+        "title": "Require Plan Approval Before Coding",
+        "description": "Instruct coding agents to present an implementation plan and wait for approval before editing code.",
+        "type": "boolean",
+        "default": false
+      },
+      {
+        "key": "enforcePlanLock",
+        "title": "Enforce Plan Lock via Tool Hook",
+        "description": "Block Edit/Write/mutating Bash tools via agent.tool.before (Claude Code) until you click Approve Plan in Task Bridge.",
+        "type": "boolean",
+        "default": false
+      },
+      {
+        "key": "autoSyncMinutes",
+        "title": "Fleet Auto-Sync Interval",
+        "description": "Automatically refresh tickets and ticket comments while work is in flight in Fleet.",
+        "type": "string",
+        "default": "5",
+        "enum": ["0", "2", "5", "10"],
+        "enumLabels": [
+          "Off (manual sync only)",
+          "Every 2 minutes",
+          "Every 5 minutes",
+          "Every 10 minutes"
+        ]
+      },
+      {
+        "key": "worktreeCopyFiles",
+        "title": "Local Files to Copy into New Worktrees",
+        "description": "Comma-separated relative paths (e.g. .env.local, .claude/settings.local.json) copied from the primary worktree on dispatch.",
+        "type": "string",
+        "default": "",
+        "placeholder": ".env.local, .claude/settings.local.json"
+      },
+      {
+        "key": "autoMoveInProgress",
+        "title": "Auto-move ticket to In Progress",
+        "description": "Automatically transition the ticket status to 'In Progress' when starting work.",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "injectCompletionSkill",
+        "title": "Include completion runbook in agent prompt",
+        "description": "Append instructions so the agent knows how to comment and move the ticket to 'In Review' when done.",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "notionDatabaseId",
+        "title": "Notion Tasks Database ID",
+        "description": "32-character Notion Database ID to query tasks from (configure the Notion API token in the Task Bridge panel).",
+        "type": "string",
+        "default": "",
+        "placeholder": "e.g. a1b2c3d4e5f6..."
+      },
+      {
+        "key": "notionStatusProperty",
+        "title": "Notion Status Property Name",
+        "description": "Name of the Status or Select property in your Notion database.",
+        "type": "string",
+        "default": "Status"
+      }
+    ]
+  },
+  "capabilities": [
+    { "kind": "storage:own" },
+    { "kind": "settings:own" },
+    { "kind": "secrets:own" },
+    { "kind": "workspace:read" },
+    { "kind": "workspace:write" },
+    { "kind": "agent:read" },
+    { "kind": "agent:launch" },
+    { "kind": "notifications:show" }
+  ],
+  "icon": "assets/task-bridge-icon.png",
+  "cover": {
+    "path": "assets/task-bridge-introduction.png",
+    "alt": "Task Bridge — Linear, Jira, and Notion to Orca worktrees with CLAUDE.md guidelines, Plan-First Lock, Fleet monitoring, and comment feedback."
+  },
+  "screenshots": [
+    {
+      "path": "assets/task-bridge-fleet-plan.png",
+      "alt": "In-Flight Fleet monitoring, CLAUDE.md guidelines, custom branch profiles, Plan-First Execution Gate, and comment feedback loop in dark mode.",
+      "caption": "In-Flight Fleet, Repo Guidelines (CLAUDE.md/AGENTS.md), Plan-First Gate, Comment Feedback Loop, and Worktree Cleanup.",
+      "theme": "dark"
+    },
+    {
+      "path": "assets/task-bridge-dark.png",
+      "alt": "English DEMO queue and workbench view in dark mode showing scope filters, parent/child issues, and sanitized agent prompt preview.",
+      "caption": "Dark mode Queue & Workbench with sample tickets, parent/child hierarchy filters, and worktree dispatch.",
+      "theme": "dark"
+    },
+    {
+      "path": "assets/task-bridge-connections.png",
+      "alt": "Task Bridge Add & Connect provider setup, multi-repo prefix routing, Verify AC, Done/In Review transitions, and Fleet Clear Finished / Remove cleanup.",
+      "caption": "Provider Connections (Linear, Jira & Notion), Multi-Repo Prefix Routing, and Fleet Review & Cleanup Controls.",
+      "theme": "dark"
+    },
+    {
+      "path": "assets/task-bridge-light.png",
+      "alt": "English DEMO queue and workbench view in light mode showing scope filters, parent/child issues, and sanitized agent prompt preview.",
+      "caption": "Light mode Queue & Workbench with sample tickets, parent/child hierarchy filters, and worktree dispatch.",
+      "theme": "light"
+    }
+  ]
+}
