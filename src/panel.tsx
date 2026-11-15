@@ -12,6 +12,7 @@ import {
   Heading,
   Input,
   KeyValue,
+  Link,
   plugin,
   read,
   RelativeTime,
@@ -77,7 +78,8 @@ const INITIAL_STATE: TaskBridgeState = {
   autoSyncMinutes: 5,
   autoMoveInProgress: true,
   injectCompletionSkill: true,
-  lastSyncedAt: null
+  lastSyncedAt: null,
+  diagnosticsReport: ''
 }
 
 const bridgeState = atom<TaskBridgeState>(INITIAL_STATE)
@@ -1659,6 +1661,29 @@ export default function Panel() {
                 >
                   Save Notion Token
                 </Button>
+              </Stack>
+            </Card>
+
+            <Card
+              title="Support & Diagnostics"
+              description="Copy the sanitized summary below (no tokens, emails, URLs, or ticket content) when opening a GitHub issue."
+            >
+              <Stack gap="xs">
+                <CodeView
+                  label="Sanitized Diagnostics"
+                  language="text"
+                  wrap
+                  maxHeight="sm"
+                  code={state.diagnosticsReport || 'Sync or reload panel to generate diagnostics.'}
+                />
+                <Row justify="between" align="center" wrap>
+                  <Link href="https://github.com/CarlosManuelDiaz/task-bridge/issues/new/choose">
+                    Report Bug or Request Feature
+                  </Link>
+                  <Text muted size="xs">
+                    Logs: <Code>orca plugin logs carlosmanueldiaz.task-bridge</Code>
+                  </Text>
+                </Row>
               </Stack>
             </Card>
           </Stack>

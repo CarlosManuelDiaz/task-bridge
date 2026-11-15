@@ -52,6 +52,7 @@ import {
   type VerifyAcOutput
 } from './protocol'
 import {
+  redactSecrets,
   sanitizeBranchPrefix,
   sanitizeUntrustedText,
   validateAgentName,
@@ -305,15 +306,64 @@ function mapPriority(raw: unknown): TaskPriority {
   return 'medium'
 }
 
-function mapIssueKind(issueType: string, title: string): TaskKind {
-  const combined = `${issueType} ${title}`.toLowerCase()
-  if (/\b(bug|fix|defect|incident|hotfix|regression|crash)\b/.test(combined)) {
+export const PLUGIN_VERSION = '0.1.1'
+
+export function mapIssueKind(issueType: string, title: string): TaskKind {
+  const typeLower = issueType.toLowerCase()
+  const titleLower = title.toLowerCase()
+  const combined = `${typeLower} ${titleLower}`
+  if (
+    /\b(bug|defect|incident|error|incidencia|fallo|aver[ií]a)\b/.test(typeLower) ||
+    /\b(bug|fix|defect|incident|hotfix|regression|crash|incidencia|fallo)\b/.test(combined)
+  ) {
     return 'bug'
   }
-  if (/\b(chore|refactor|cleanup|docs|ci|build|deps|maintenance)\b/.test(combined)) {
+  if (
+    /\b(chore|refactor|cleanup|docs|ci|build|deps|maintenance|mantenimiento|limpieza|documentaci[oó]n|t[eé]cnic[oa])\b/.test(
+      combined
+    )
+  ) {
     return 'chore'
   }
   return 'feature'
+}
+
+export interface DiagnosticsSnapshotInput {
+  pluginVersion?: string
+  linearConnected: boolean
+  jiraSiteCount: number
+  notionConfigured: boolean
+  scope: TaskScopeFilter
+  taskCount: number
+  fleetCount: number
+  repoCount: number
+  usingDemoData: boolean
+  availableAgents: AgentAvailability[]
+  lastError?: string | null
+}
+
+/**
+ * Builds a shareable, secret-free diagnostics block for GitHub issue reports.
+ * Intentionally omits emails, site URLs, repository paths, tokens, and ticket content.
+ */
+export function buildDiagnosticsReport(input: DiagnosticsSnapshotInput): string {
+  const version = input.pluginVersion ?? PLUGIN_VERSION
+  const agents = input.availableAgents
+    .map((a) => `${a.id}=${a.cliFound ? 'yes' : 'no'}`)
+    .join(', ')
+  const cleanError = input.lastError
+    ? redactSecrets(sanitizeUntrustedText(input.lastError, 200))
+    : 'none'
+
+  return redactSecrets(
+    [
+      `Task Bridge v${version} | OS: ${process.platform} (${process.arch}) | Node: ${process.version}`,
+      `Providers: Linear=${input.linearConnected ? 'connected' : 'not_connected'} | Jira=${input.jiraSiteCount} site(s) | Notion=${input.notionConfigured ? 'configured' : 'not_set'}`,
+      `State: scope=${input.scope} | tasks=${input.taskCount} | fleet=${input.fleetCount} | repos=${input.repoCount} | demo=${input.usingDemoData}`,
+      `Agents CLI: ${agents || 'none'}`,
+      `Last error: ${cleanError}`
+    ].join('\n')
+  )
 }
 
 /**
@@ -1784,6 +1834,7 @@ export default function activate(orca: OrcaWorkerApi): void {
   let cachedJiraSites: JiraSiteConnection[] = []
   let cachedSelectedJiraSiteId: string | null = null
   let cachedLinearConnected = false
+  let lastWorkerError: string | null = null
   let cachedGuidelinesByRepoId = new Map<string, RepoGuidelines>()
   let cachedBranchConfig: BranchNamingConfig = {
     branchPrefixMode: 'auto',
@@ -2522,7 +2573,19 @@ export default function activate(orca: OrcaWorkerApi): void {
       autoSyncMinutes: cfg.autoSyncMinutes,
       autoMoveInProgress: cfg.autoMoveInProgress,
       injectCompletionSkill: cfg.injectCompletionSkill,
-      lastSyncedAt: typeof rawLastSynced === 'number' ? rawLastSynced : null
+      lastSyncedAt: typeof rawLastSynced === 'number' ? rawLastSynced : null,
+      diagnosticsReport: buildDiagnosticsReport({
+        linearConnected: cachedLinearConnected,
+        jiraSiteCount: cachedJiraSites.length,
+        notionConfigured,
+        scope,
+        taskCount: tasks.length,
+        fleetCount: fleet.length,
+        repoCount: availableRepos.length,
+        usingDemoData,
+        availableAgents,
+        lastError: lastWorkerError
+      })
     }
   }
 
@@ -3327,6 +3390,7 @@ export default function activate(orca: OrcaWorkerApi): void {
         console.error(`[task-bridge] Notion sync exception: ${notionSyncError}`)
       }
     }
+    lastWorkerError = notionSyncError ? redactSecrets(sanitizeUntrustedText(notionSyncError, 200)) : null
 
     // Merge imported tasks with stored tasks (preserving local worktree/agent metadata) without mixing DEMO tasks (Fixes Bug #8)
     if (importedItems.length > 0) {

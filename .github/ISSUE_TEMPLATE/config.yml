@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Orca Plugin Directory Listing
+    url: https://www.onorca.dev/plugins/CarlosManuelDiaz/task-bridge
+    about: View install instructions and release status on Orca's plugin directory.

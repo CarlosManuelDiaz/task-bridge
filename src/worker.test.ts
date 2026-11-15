@@ -16,8 +16,10 @@ import {
 } from './security'
 import * as main from './worker'
 import {
+  buildDiagnosticsReport,
   copyLocalSetupFiles,
   extractAcceptanceCriteriaFromText,
+  mapIssueKind,
   mapStatusToCategory,
   parseJiraTasksResult,
   parseLinearTasksResult,
@@ -1881,4 +1883,33 @@ test('hydrates Jira descriptions, acceptance criteria, Spanish statuses, and par
     setCliRunnerForTests(null)
     await worker.deactivate()
   }
+})
+
+test('classifies localized Jira issue kinds and builds secret-free diagnostics reports', () => {
+  assert.equal(mapIssueKind('Error', 'Pantalla en blanco al guardar'), 'bug')
+  assert.equal(mapIssueKind('Incidencia', 'Timeout en login'), 'bug')
+  assert.equal(mapIssueKind('Historia', 'Improve error handling middleware'), 'feature')
+  assert.equal(mapIssueKind('Tarea', 'Limpieza de dependencias'), 'chore')
+
+  const diag = buildDiagnosticsReport({
+    pluginVersion: '0.1.1',
+    linearConnected: true,
+    jiraSiteCount: 1,
+    notionConfigured: true,
+    scope: 'assigned',
+    taskCount: 8,
+    fleetCount: 2,
+    repoCount: 2,
+    usingDemoData: false,
+    availableAgents: [
+      { id: 'antigravity', label: 'Antigravity', cliFound: true },
+      { id: 'claude', label: 'Claude Code', cliFound: false }
+    ],
+    lastError: 'Notion failed with Authorization Bearer ntn_1234567890abcdef12345'
+  })
+
+  assert.ok(diag.includes('Task Bridge v0.1.1'))
+  assert.ok(diag.includes('Linear=connected | Jira=1 site(s) | Notion=configured'))
+  assert.ok(diag.includes('Agents CLI: antigravity=yes, claude=no'))
+  assert.equal(diag.includes('ntn_1234567890abcdef12345'), false)
 })

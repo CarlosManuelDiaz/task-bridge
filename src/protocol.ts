@@ -189,6 +189,7 @@ export interface TaskBridgeState {
   autoMoveInProgress: boolean
   injectCompletionSkill: boolean
   lastSyncedAt: number | null
+  diagnosticsReport?: string
 }
 
 export interface AddManualTaskInput {

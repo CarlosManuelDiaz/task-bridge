@@ -7,7 +7,7 @@ Keep **Linear**, **Jira**, and **Notion** within reach in the Orca ADE right sid
 | Field | Value |
 | --- | --- |
 | Plugin ID | `task-bridge` |
-| Version | `0.1.0` |
+| Version | `0.1.1` |
 | Orca Requirement | `>=1.4.248` |
 | Execution | `trusted-worker` (`pluginApi: 1`) |
 | UI Mode | Declarative host-rendered `components` (`@stablyai/orca-plugin-sdk/ui`) |
@@ -175,6 +175,15 @@ orca plugin test ./task-bridge --json
 # 4. Inspect permissions and compute approval fingerprint
 orca plugin inspect ./task-bridge --json
 ```
+
+---
+
+## Support & Bug Reports
+
+Found an issue or want to suggest an improvement?
+
+- **Open an issue:** [CarlosManuelDiaz/task-bridge/issues](https://github.com/CarlosManuelDiaz/task-bridge/issues/new/choose)
+- **Diagnostics:** Open **Add & Connect → Support & Diagnostics** inside Task Bridge to copy a sanitized diagnostics block (no tokens, emails, URLs, or ticket content), and optionally run `orca plugin logs carlosmanueldiaz.task-bridge`.
 
 ---
 

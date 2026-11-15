@@ -1,0 +1,18 @@
+name: Feature Request
+description: Suggest an improvement, new workflow shortcut, or provider enhancement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Workflow Gap
+      description: What workflow in Orca + Linear/Jira/Notion could be smoother?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: Describe how you'd like it to work in Queue, Fleet, Workbench, or Add & Connect.

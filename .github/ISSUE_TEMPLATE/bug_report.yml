@@ -1,0 +1,58 @@
+name: Bug Report
+description: Report unexpected behavior, sync failures, or workflow transition issues in Task Bridge.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve **Task Bridge**! Please include the sanitized diagnostics block from **Add & Connect -> Support & Diagnostics** (never paste Notion tokens, API keys, or private emails).
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Affected Provider
+      options:
+        - Linear
+        - Jira (Cloud / Server)
+        - Notion
+        - Multi-provider / General UI
+    validations:
+      required: true
+
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Coding Agent
+      options:
+        - Antigravity (agy)
+        - Claude Code
+        - Codex
+        - Gemini CLI
+        - Cursor CLI
+        - None / Sync only
+    validations:
+      required: true
+
+  - type: input
+    id: orca_version
+    attributes:
+      label: Orca & OS Version
+      placeholder: "e.g. Orca 1.4.250 on Windows 11 / macOS 15"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the expected behavior and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized Diagnostics & Logs
+      description: Paste the block from "Add & Connect -> Support & Diagnostics" and optional output from `orca plugin logs carlosmanueldiaz.task-bridge`.
+      render: text
