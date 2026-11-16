@@ -9,6 +9,9 @@ const ANSI_ESCAPE_REGEX =
 
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS_REGEX = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g
+const INVISIBLE_CHARS_REGEX = /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/g
+const BOUNDARY_TAG_REGEX =
+  /(?:<|&lt;|\uFF1C)\s*\/?\s*untrusted[\s_-]*ticket[\s_-]*data(?:[^<>\n\uFF1C\uFF1E]{0,80}?(?:>|&gt;|\uFF1E))?/gi
 
 const SECRET_PATTERNS: readonly RegExp[] = [
   /\bntn_[A-Za-z0-9]{12,}\b/g,
@@ -17,7 +20,10 @@ const SECRET_PATTERNS: readonly RegExp[] = [
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
   /\bsk-[A-Za-z0-9_-]{20,}\b/g,
-  /\bATATT3x[A-Za-z0-9_-]{16,}\b/g,
+  /\bATATT3x[A-Za-z0-9_\-=]{16,}/g,
+  /\bBasic\s+[A-Za-z0-9+/=]{12,}/gi,
+  /\bxox[abpr]-[A-Za-z0-9-]{10,}/g,
+  /\bAKIA[0-9A-Z]{16}\b/g,
   /\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b/gi
 ]
 
@@ -30,13 +36,16 @@ const NOTION_ID_REGEX =
 const UNSAFE_URL_CHARS = /['"`$;&|<>\\\s\u0000-\u001F\u007F]/
 
 /**
- * Strips ANSI/OSC terminal escape codes, control characters, and redacts any embedded API tokens.
+ * Strips ANSI/OSC terminal escape codes, control and zero-width/bidi invisible characters,
+ * neutralizes fake boundary tags, and redacts any embedded API tokens.
  */
 export function sanitizeUntrustedText(input: string, maxLength = 4000): string {
   if (!input) return ''
   const withoutAnsi = input.replace(ANSI_ESCAPE_REGEX, '')
   const withoutCtrl = withoutAnsi.replace(CONTROL_CHARS_REGEX, '')
-  const redacted = redactSecrets(withoutCtrl)
+  const withoutInvisible = withoutCtrl.replace(INVISIBLE_CHARS_REGEX, '')
+  const neutralizedBoundary = withoutInvisible.replace(BOUNDARY_TAG_REGEX, '[removed boundary tag]')
+  const redacted = redactSecrets(neutralizedBoundary)
   return redacted.trim().slice(0, maxLength)
 }
 
@@ -174,4 +183,338 @@ export function validateNotionId(rawId: string | undefined): string | null {
     return null
   }
   return trimmed
+}
+
+function escapeRegexLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * Matches a ticket key inside a Git branch name using non-alphanumeric left boundaries and
+ * non-digit right boundaries so `ENG-6` never links to `feature/ENG-674_x` or `UI-1` to `feat/gui-12`.
+ */
+export function doesBranchMatchTicketKey(branch: string, key: string): boolean {
+  const safeKey = validateTicketKey(key)
+  if (!safeKey || !branch) return false
+  const regex = new RegExp(`(?:^|[^a-z0-9])${escapeRegexLiteral(safeKey)}(?![0-9])`, 'i')
+  return regex.test(branch)
+}
+
+const SHARED_READ_ONLY_TOOLS = new Set([
+  'read',
+  'glob',
+  'grep',
+  'ls',
+  'read_file',
+  'list_dir',
+  'list_directory',
+  'view_file',
+  'view_file_outline',
+  'view_code_item',
+  'find_by_name',
+  'grep_search',
+  'search_file_content',
+  'file_search',
+  'codebase_search',
+  'grep_files',
+  'webfetch',
+  'web_fetch',
+  'websearch',
+  'google_web_search',
+  'todoread',
+  'todowrite',
+  'taskoutput',
+  'tasklist',
+  'taskget',
+  'askuserquestion',
+  'exitplanmode'
+])
+
+const READ_ONLY_TOOLS_BY_AGENT: Record<string, ReadonlySet<string>> = {
+  claude: SHARED_READ_ONLY_TOOLS,
+  gemini: SHARED_READ_ONLY_TOOLS,
+  codex: SHARED_READ_ONLY_TOOLS,
+  cursor: SHARED_READ_ONLY_TOOLS,
+  antigravity: SHARED_READ_ONLY_TOOLS
+}
+
+const PLAN_LOCK_SHELL_TOOLS = new Set([
+  'bash',
+  'shell',
+  'execute_command',
+  'run_command',
+  'powershell',
+  'run_shell_command',
+  'run_terminal_cmd'
+])
+
+const ALLOWED_READ_ONLY_COMMANDS = new Set([
+  'ls',
+  'dir',
+  'cat',
+  'head',
+  'tail',
+  'wc',
+  'rg',
+  'grep',
+  'egrep',
+  'fgrep',
+  'ag',
+  'fd',
+  'pwd',
+  'tree',
+  'stat',
+  'file',
+  'which',
+  'where',
+  'where.exe',
+  'type',
+  'echo',
+  'true',
+  'false',
+  'get-childitem',
+  'gci',
+  'get-content',
+  'gc',
+  'select-string',
+  'sls',
+  'get-location',
+  'test-path',
+  'resolve-path'
+])
+
+const ALLOWED_GIT_READ_SUBCOMMANDS = new Set([
+  'status',
+  'log',
+  'diff',
+  'show',
+  'blame',
+  'rev-parse',
+  'ls-files',
+  'grep',
+  'describe',
+  'shortlog',
+  'branch'
+])
+
+const FIND_MUTATING_FLAGS = new Set([
+  '-delete',
+  '-exec',
+  '-execdir',
+  '-ok',
+  '-okdir',
+  '-fprint',
+  '-fprint0',
+  '-fprintf',
+  '-fls'
+])
+
+const GIT_BRANCH_MUTATING_FLAGS = new Set([
+  '-d',
+  '-D',
+  '-m',
+  '-M',
+  '-c',
+  '-C',
+  '--delete',
+  '--move',
+  '--copy',
+  '--edit-description',
+  '--set-upstream-to',
+  '--unset-upstream'
+])
+
+function extractCommandTextForPlanLock(input: unknown): string {
+  if (typeof input === 'string') return input
+  if (!input || typeof input !== 'object') return ''
+  const obj = input as Record<string, unknown>
+  for (const field of ['command', 'CommandLine', 'cmd', 'script', 'argv']) {
+    const val = obj[field]
+    if (typeof val === 'string') return val
+    if (Array.isArray(val) && val.every((item) => typeof item === 'string')) {
+      return val.join(' ')
+    }
+  }
+  return ''
+}
+
+function splitShellSegmentsAndCheckUnquotedMeta(cmd: string): string[] | null {
+  const segments: string[] = []
+  let current = ''
+  let quote: '"' | "'" | null = null
+
+  for (let i = 0; i < cmd.length; i += 1) {
+    const ch = cmd[i]
+    const nextCh = cmd[i + 1] ?? ''
+
+    if (quote) {
+      if (ch === '\\' && quote === '"' && i + 1 < cmd.length) {
+        current += ch + nextCh
+        i += 1
+        continue
+      }
+      if (ch === quote) {
+        quote = null
+      }
+      current += ch
+      continue
+    }
+
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      current += ch
+      continue
+    }
+
+    // Reject unquoted redirections, command substitutions, backticks, and process substitutions
+    if (
+      ch === '>' ||
+      ch === '`' ||
+      (ch === '$' && nextCh === '(') ||
+      (ch === '<' && nextCh === '(')
+    ) {
+      return null
+    }
+
+    if (ch === ';' || ch === '\n' || ch === '\r') {
+      if (current.trim()) segments.push(current.trim())
+      current = ''
+      continue
+    }
+    if ((ch === '&' && nextCh === '&') || (ch === '|' && nextCh === '|')) {
+      if (current.trim()) segments.push(current.trim())
+      current = ''
+      i += 1
+      continue
+    }
+    if (ch === '|') {
+      if (nextCh === '&') return null
+      if (current.trim()) segments.push(current.trim())
+      current = ''
+      continue
+    }
+    if (ch === '&') {
+      return null
+    }
+
+    current += ch
+  }
+
+  if (quote) return null
+  if (current.trim()) segments.push(current.trim())
+  return segments
+}
+
+function tokenizeSimpleShellSegment(segment: string): string[] | null {
+  const tokens: string[] = []
+  let current = ''
+  let quote: '"' | "'" | null = null
+
+  for (let i = 0; i < segment.length; i += 1) {
+    const ch = segment[i]
+    if (quote) {
+      if (ch === '\\' && quote === '"' && i + 1 < segment.length) {
+        current += segment[i + 1]
+        i += 1
+        continue
+      }
+      if (ch === quote) {
+        quote = null
+        continue
+      }
+      current += ch
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      continue
+    }
+    if (/\s/.test(ch)) {
+      if (current) {
+        tokens.push(current)
+        current = ''
+      }
+      continue
+    }
+    current += ch
+  }
+
+  if (quote) return null
+  if (current) tokens.push(current)
+  return tokens
+}
+
+function isAllowedGitReadSegment(tokens: string[]): boolean {
+  let idx = 1
+  while (idx < tokens.length) {
+    const tok = tokens[idx]
+    if (!tok.startsWith('-')) break
+    if (tok === '-C' || tok === '--git-dir' || tok === '--work-tree' || tok === '-c') {
+      idx += 2
+      continue
+    }
+    idx += 1
+  }
+  const subcommand = tokens[idx]?.toLowerCase() ?? ''
+  if (!ALLOWED_GIT_READ_SUBCOMMANDS.has(subcommand)) return false
+  if (subcommand === 'branch') {
+    for (let i = idx + 1; i < tokens.length; i += 1) {
+      const arg = tokens[i]
+      if (GIT_BRANCH_MUTATING_FLAGS.has(arg)) return false
+      if (!arg.startsWith('-')) return false
+    }
+  }
+  return true
+}
+
+function isAllowedFindReadSegment(tokens: string[]): boolean {
+  for (let i = 1; i < tokens.length; i += 1) {
+    const lower = tokens[i].toLowerCase()
+    if (FIND_MUTATING_FLAGS.has(lower)) return false
+  }
+  return true
+}
+
+/**
+ * Strictly allows only read-only inspection shell commands while Plan Lock is active.
+ */
+export function isReadOnlyShellCommand(cmd: string): boolean {
+  if (!cmd.trim()) return false
+  const segments = splitShellSegmentsAndCheckUnquotedMeta(cmd)
+  if (!segments || segments.length === 0) return false
+
+  for (const segment of segments) {
+    const tokens = tokenizeSimpleShellSegment(segment)
+    if (!tokens || tokens.length === 0) return false
+    const bin = tokens[0].toLowerCase()
+    if (bin === 'git') {
+      if (!isAllowedGitReadSegment(tokens)) return false
+      continue
+    }
+    if (bin === 'find') {
+      if (!isAllowedFindReadSegment(tokens)) return false
+      continue
+    }
+    if (!ALLOWED_READ_ONLY_COMMANDS.has(bin)) {
+      return false
+    }
+  }
+
+  return true
+}
+
+/**
+ * Evaluates whether a tool call is permitted while Plan Lock is active (fail-closed for unknown tools).
+ */
+export function isPlanLockToolAllowed(agentName: string, toolName: string, input: unknown): boolean {
+  const toolLower = toolName.trim().toLowerCase()
+  const agentLower = (agentName || 'claude').trim().toLowerCase()
+  const agentReadOnlySet = READ_ONLY_TOOLS_BY_AGENT[agentLower] ?? SHARED_READ_ONLY_TOOLS
+  if (agentReadOnlySet.has(toolLower)) {
+    return true
+  }
+  if (PLAN_LOCK_SHELL_TOOLS.has(toolLower)) {
+    return isReadOnlyShellCommand(extractCommandTextForPlanLock(input))
+  }
+  return false
 }
