@@ -2,7 +2,7 @@
 
 All notable changes to Task Bridge are documented in this file.
 
-## [Unreleased]
+## [0.2.0] - 2026-11-16
 
 ### Repo Configuration, Skills, Guards & Multi-Repo (`A1`–`A7`, `N1`–`N3`)
 - **Shared `.task-bridge.json` repository config (`A1`)**: Loaded `.task-bridge.json` cleanly with strict symlink/size/containment checks and clear override precedence (`defaults < .task-bridge.json < RepoProfile user overrides`), exposing config source badges in Workbench.
