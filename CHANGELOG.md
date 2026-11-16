@@ -4,6 +4,15 @@ All notable changes to Task Bridge are documented in this file.
 
 ## [Unreleased]
 
+### Repo Configuration, Skills, Guards & Multi-Repo (`A1`–`A7`, `N1`–`N3`)
+- **Shared `.task-bridge.json` repository config (`A1`)**: Loaded `.task-bridge.json` cleanly with strict symlink/size/containment checks and clear override precedence (`defaults < .task-bridge.json < RepoProfile user overrides`), exposing config source badges in Workbench.
+- **Custom AC headings, branch types & status aliases (`A2`–`A4`)**: Added configurable `acceptanceCriteriaHeadings`, keyword/`issueType`-based `branchTypes` rules (with manual override selector in Workbench), and `statusAliases` for status classification and Jira/Linear transitions.
+- **Allowlisted worktree setup commands (`A5`)**: Added `worktreeSetupCommands` filtered strictly through `parseWorktreeSetupCommand` (`npm ci`, `npm install`, `pnpm install`, `yarn install`, `composer install`, `uv sync`) and gated behind per-repo SHA-256 hash approval (`tasks.approveRepoSetup`).
+- **Chained/parent subtask base branches & multi-repo dispatch (`A6`, `A7`)**: Added `subtaskBase: "default" | "parent" | "chain"` (`--base` on `worktree create`) in `dispatchChildren`, and `repoIds` multi-repository dispatch tracking `linkedWorkspaces`.
+- **Safe `SKILL.md` discovery & workflow skill prompts (`N1`)**: Added symlink-safe `SKILL.md` discovery across `.agents/skills`, `.claude/skills`, `.codex/skills`, `.gemini/skills`, `.cursor/skills`, `.github/skills`, per-phase `workflow` skill mapping (`dispatch`, `verify`, `feedback`, `prFeedback`), and `planGate: "skill" | "plugin" | "both"`.
+- **Cross-agent Git write guard (`N2`)**: Added `guard.denyGitWrites` in `agent.tool.before` across all agents via `findDeniedGitWriteInToolCall` even when Plan Lock is disabled.
+- **PR review feedback tracking & follow-up (`N3`)**: Counted open PR review feedback (`unresolvedPrCommentsCount`) during PR detection and added `tasks.sendPrFeedback` with Fleet badges and `Send PR Feedback` action.
+
 ### Security (S1–S7)
 - **Prompt isolation (`S1`)**: Stripped zero-width/bidi invisible characters (`\u200B-\u200F`, `\u202A-\u202E`, `\u2060-\u2064`, `\u2066-\u2069`, `\uFEFF`), neutralized forged `</untrusted_ticket_data>` closing-tag variants, moved ticket titles/metadata (`Title`, `Project`, `Type`, `Assignee`, `Parent`) inside `<untrusted_ticket_data>` in dispatch, AC verification, and comment-feedback prompts, and removed untrusted ticket titles from the `agent.prompt.before` reminder.
 - **Plan-First Gate allowlist (`S2`)**: Switched `agent.tool.before` from regex denylist to per-agent read-only tool and command allowlists (supporting quote-aware read-only inspection and multi-agent tools), failing closed on worker restart by hydrating lookup maps from storage on activation.

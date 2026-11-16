@@ -16,12 +16,62 @@ export type LiveAgentState = 'idle' | 'working' | 'waiting' | 'blocked' | 'done'
 export type AcVerificationStatus = 'unverified' | 'running' | 'verified' | 'failed' | 'unknown'
 export type PlanApprovalStatus = 'not_required' | 'awaiting_approval' | 'approved'
 
+export interface BranchTypeRule {
+  prefix: string
+  issueTypes?: string[]
+  keywords?: string[]
+}
+
+export interface StatusAliasesConfig {
+  inProgress?: string[]
+  inReview?: string[]
+  done?: string[]
+}
+
+export interface DiscoveredSkill {
+  name: string
+  description: string
+  relativePath: string
+  rootDir: string
+  suggestedMoment?: 'dispatch' | 'bug' | 'verify' | 'feedback' | 'prFeedback'
+}
+
+export interface RepoWorkflowMapping {
+  dispatch?: Record<string, string>
+  verify?: string
+  feedback?: string
+  prFeedback?: string
+}
+
+export interface RepoConfigFile {
+  branchTemplate?: string
+  branchTypes?: BranchTypeRule[]
+  acceptanceCriteriaHeadings?: string[]
+  statusAliases?: StatusAliasesConfig
+  worktreeCopyFiles?: string[]
+  worktreeSetupCommands?: string[]
+  workflow?: RepoWorkflowMapping
+  guard?: { denyGitWrites?: string[] }
+  planGate?: 'plugin' | 'skill' | 'both'
+  subtaskBase?: 'default' | 'parent' | 'chain'
+  skillDirs?: string[]
+}
+
+export interface RepoSetupApproval {
+  repoId: string
+  repoName: string
+  commands: string[]
+  configHash: string
+  approved: boolean
+}
+
 export interface BranchNamingConfig {
   branchPrefixMode?: string
   branchTemplate?: string
   featurePrefix?: string
   bugPrefix?: string
   chorePrefix?: string
+  branchTypes?: BranchTypeRule[]
 }
 
 export interface TaskCommentItem {
@@ -124,10 +174,17 @@ export interface TaskItem {
   acVerificationSummary?: string
   acReviewerTerminalId?: string
   repoId?: string
+  linkedWorkspaces?: Array<{
+    repoId: string
+    workspaceId: string
+    branch: string
+    terminalId?: string
+  }>
   planApproved?: boolean
   planLockActive?: boolean
   comments?: TaskCommentItem[]
   unreadCommentsCount?: number
+  unresolvedPrCommentsCount?: number
   fleetDismissed?: boolean
   demo?: boolean
   updatedAt: number
@@ -156,6 +213,7 @@ export interface FleetItem {
   acVerificationStatus: AcVerificationStatus
   planStatus: PlanApprovalStatus
   unreadCommentsCount: number
+  unresolvedPrCommentsCount?: number
 }
 
 export interface TaskBridgeState {
@@ -168,6 +226,11 @@ export interface TaskBridgeState {
   activeRepoId: string | null
   activeRepoGuidelines: RepoGuidelines | null
   repoGuidelinesByRepoId?: Record<string, RepoGuidelines>
+  repoConfigsByRepoId?: Record<string, RepoConfigFile>
+  repoConfigSourcesByRepoId?: Record<string, Record<string, 'default' | 'repoFile' | 'userProfile'>>
+  repoSetupApprovals?: RepoSetupApproval[]
+  discoveredSkillsByRepoId?: Record<string, DiscoveredSkill[]>
+  branchTypes?: BranchTypeRule[]
   availableRepos: AvailableRepo[]
   availableAgents: AgentAvailability[]
   repoProfiles: Record<string, RepoProfile>
@@ -212,7 +275,9 @@ export interface DispatchTaskInput {
   taskId: string
   agent?: string
   repoId?: string
+  repoIds?: string[]
   customBranch?: string
+  branchPrefixOverride?: string
   createWorktree?: boolean
   requirePlanApproval?: boolean
   enforcePlanLock?: boolean
@@ -357,8 +422,9 @@ export interface DismissFleetOutput {
  * prefix mapping + template (e.g., `{prefix}/{key}-{slug}` or `feature/{KEY}-{slug}`).
  */
 export function buildBranchName(
-  task: Pick<TaskItem, 'key' | 'title' | 'kind'> & { project?: string },
-  configOrMode: string | BranchNamingConfig = 'auto'
+  task: Pick<TaskItem, 'key' | 'title' | 'kind'> & { project?: string; issueType?: string },
+  configOrMode: string | BranchNamingConfig = 'auto',
+  explicitPrefix?: string
 ): string {
   const cfg: BranchNamingConfig =
     typeof configOrMode === 'string' ? { branchPrefixMode: configOrMode } : configOrMode
@@ -369,16 +435,26 @@ export function buildBranchName(
   const mode = cfg.branchPrefixMode ?? 'auto'
 
   let prefix = featurePrefix
-  if (mode === 'fix') {
+  if (explicitPrefix && explicitPrefix.trim()) {
+    prefix = sanitizeBranchPrefix(explicitPrefix, featurePrefix)
+  } else if (mode === 'fix') {
     prefix = bugPrefix
   } else if (mode === 'chore') {
     prefix = chorePrefix
   } else if (mode === 'feat') {
     prefix = featurePrefix
   } else {
-    if (task.kind === 'bug') prefix = bugPrefix
-    else if (task.kind === 'chore') prefix = chorePrefix
-    else prefix = featurePrefix
+    // Check configurable `branchTypes` rules first (`issueTypes` or `keywords`), preserving F10 fallback
+    const matchedRule = matchBranchTypeRule(task, cfg.branchTypes)
+    if (matchedRule) {
+      prefix = sanitizeBranchPrefix(matchedRule.prefix, featurePrefix)
+    } else if (task.kind === 'bug') {
+      prefix = bugPrefix
+    } else if (task.kind === 'chore') {
+      prefix = chorePrefix
+    } else {
+      prefix = featurePrefix
+    }
   }
 
   const safeKey = validateTicketKey(task.key) ?? 'TASK-1'
@@ -409,6 +485,35 @@ export function buildBranchName(
   return validateBranchName(rendered) ?? validateBranchName(fallback) ?? `${prefix}/${lowerKey}`
 }
 
+function matchBranchTypeRule(
+  task: { title: string; issueType?: string },
+  rules?: readonly BranchTypeRule[]
+): BranchTypeRule | undefined {
+  if (!Array.isArray(rules) || rules.length === 0) return undefined
+  const typeLower = (task.issueType ?? '').trim().toLowerCase()
+  const titleLower = (task.title ?? '').trim().toLowerCase()
+
+  if (typeLower) {
+    const byType = rules.find((r) =>
+      r.issueTypes?.some((t) => t.trim().toLowerCase() === typeLower)
+    )
+    if (byType) return byType
+  }
+
+  for (const rule of rules) {
+    if (!rule.keywords?.length) continue
+    for (const kw of rule.keywords) {
+      const cleanKw = kw.trim().toLowerCase()
+      if (!cleanKw) continue
+      const escaped = cleanKw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      if (new RegExp(`\\b${escaped}\\b`, 'i').test(titleLower)) {
+        return rule
+      }
+    }
+  }
+  return undefined
+}
+
 /**
  * Builds the structured prompt injected into the coding agent upon launch.
  * Respects repository guidelines (`CLAUDE.md`, `AGENTS.md`, PR templates) and optional
@@ -422,6 +527,7 @@ export function buildAgentPrompt(
     requirePlanApproval?: boolean
     enforcePlanLock?: boolean
     guidelines?: RepoGuidelines | null
+    skillInstructions?: string[]
   }
 ): string {
   const safeKey = validateTicketKey(task.key) ?? 'TASK-1'
@@ -470,6 +576,10 @@ export function buildAgentPrompt(
         '</repository_guidelines>'
       )
     }
+  }
+
+  if (options.skillInstructions && options.skillInstructions.length > 0) {
+    lines.push('', '## Repository Skill Guidance', ...options.skillInstructions)
   }
 
   // Kind-specific engineering guidance
@@ -683,6 +793,14 @@ declare module 'orca' {
     'tasks.transition': {
       input: TransitionTaskInput
       output: { state: TaskBridgeState; task: TaskItem; providerSynced: boolean; summary: string }
+    }
+    'tasks.approveRepoSetup': {
+      input: { repoId: string; configHash: string }
+      output: { state: TaskBridgeState; summary: string }
+    }
+    'tasks.sendPrFeedback': {
+      input: { taskId: string; customInstruction?: string; confirmNewSession?: boolean }
+      output: { state: TaskBridgeState; summary: string }
     }
     'tasks.delete': {
       input: { taskId: string }

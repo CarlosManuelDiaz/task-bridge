@@ -526,6 +526,92 @@ const AC_VERDICT_WRITE_TOOLS = new Set([
   'create_file'
 ])
 
+export interface WorktreeSetupCommandSpec {
+  executable: string
+  args: string[]
+  display: string
+}
+
+const ALLOWED_SETUP_EXACT: Record<string, { executable: string; args: string[] }> = {
+  'composer install': { executable: 'composer', args: ['install'] },
+  'npm ci': { executable: 'npm', args: ['ci'] },
+  'npm install': { executable: 'npm', args: ['install'] },
+  'pnpm install': { executable: 'pnpm', args: ['install'] },
+  'pnpm install --frozen-lockfile': {
+    executable: 'pnpm',
+    args: ['install', '--frozen-lockfile']
+  },
+  'yarn install': { executable: 'yarn', args: ['install'] },
+  'yarn install --frozen-lockfile': {
+    executable: 'yarn',
+    args: ['install', '--frozen-lockfile']
+  },
+  'uv sync': { executable: 'uv', args: ['sync'] }
+}
+
+/**
+ * Validates a `.task-bridge.json` `worktreeSetupCommands` entry against the strict allowlist (A5).
+ * Returns null for unrecognized binaries, flags, or shell metacharacters.
+ */
+export function parseWorktreeSetupCommand(raw: unknown): WorktreeSetupCommandSpec | null {
+  if (typeof raw !== 'string') return null
+  const normalized = raw.trim().replace(/\s+/g, ' ').toLowerCase()
+  const matched = ALLOWED_SETUP_EXACT[normalized]
+  if (!matched) return null
+  return {
+    executable: matched.executable,
+    args: [...matched.args],
+    display: normalized
+  }
+}
+
+/**
+ * Detects whether a shell tool invocation runs any disallowed `git <subcommand>` configured
+ * under `guard.denyGitWrites` (N2), reusing S2's quote-aware command segment splitter.
+ */
+export function findDeniedGitWriteInToolCall(
+  toolName: string,
+  input: unknown,
+  deniedGitSubcommands: readonly string[]
+): string | null {
+  if (deniedGitSubcommands.length === 0) return null
+  if (!PLAN_LOCK_SHELL_TOOLS.has(toolName.trim().toLowerCase())) return null
+  const cmd = extractCommandTextForPlanLock(input)
+  if (!cmd.trim()) return null
+
+  const deniedSet = new Set(deniedGitSubcommands.map((s) => s.trim().toLowerCase()).filter(Boolean))
+  const segments = splitShellSegmentsAndCheckUnquotedMeta(cmd)
+  if (!segments) {
+    // Unquoted subshells/redirections could hide git writes; fall back to token scan
+    const match = /\bgit\s+(?:-C\s+\S+\s+)*([a-z-]+)/i.exec(cmd)
+    if (match?.[1] && deniedSet.has(match[1].toLowerCase())) {
+      return match[1].toLowerCase()
+    }
+    return null
+  }
+
+  for (const segment of segments) {
+    const tokens = tokenizeSimpleShellSegment(segment)
+    if (!tokens || tokens.length === 0) continue
+    if (tokens[0].toLowerCase() !== 'git') continue
+    let idx = 1
+    while (idx < tokens.length) {
+      const tok = tokens[idx]
+      if (!tok.startsWith('-')) break
+      if (tok === '-C' || tok === '--git-dir' || tok === '--work-tree' || tok === '-c') {
+        idx += 2
+        continue
+      }
+      idx += 1
+    }
+    const sub = tokens[idx]?.toLowerCase() ?? ''
+    if (sub && deniedSet.has(sub)) {
+      return sub
+    }
+  }
+  return null
+}
+
 /**
  * Allows an AC Reviewer session to write ONLY its `.orca/task-bridge/ac-<KEY>.json` verdict file.
  */

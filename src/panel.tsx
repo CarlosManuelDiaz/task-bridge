@@ -101,6 +101,7 @@ const selectedAcReviewerAgent = atom<string>('selectedAcReviewerAgent', '__auto_
   persist: 'plugin'
 })
 const branchOverride = atom<string>('')
+const selectedBranchTypePrefix = atom<string>('__auto__')
 const createWorktreeToggle = atom<boolean>(true)
 const requirePlanApprovalToggle = atom<boolean>(false)
 const enforcePlanLockToggle = atom<boolean>(false)
@@ -127,12 +128,14 @@ const notionTokenInput = atom<string>('')
 
 function getBranchNamingConfig(state: TaskBridgeState, repoId?: string) {
   const profile = repoId ? state.repoProfiles?.[repoId] : undefined
+  const repoFile = repoId ? state.repoConfigsByRepoId?.[repoId] : undefined
   return {
     branchPrefixMode: state.branchPrefixMode,
-    branchTemplate: profile?.branchTemplate ?? state.branchTemplate,
-    featurePrefix: profile?.featurePrefix ?? state.featurePrefix,
-    bugPrefix: profile?.bugPrefix ?? state.bugPrefix,
-    chorePrefix: profile?.chorePrefix ?? state.chorePrefix
+    branchTemplate: profile?.branchTemplate ?? repoFile?.branchTemplate ?? state.branchTemplate,
+    featurePrefix: profile?.featurePrefix ?? repoFile?.featurePrefix ?? state.featurePrefix,
+    bugPrefix: profile?.bugPrefix ?? repoFile?.bugPrefix ?? state.bugPrefix,
+    chorePrefix: profile?.chorePrefix ?? repoFile?.chorePrefix ?? state.chorePrefix,
+    branchTypes: repoFile?.branchTypes ?? state.branchTypes
   }
 }
 
@@ -201,17 +204,39 @@ function hydrateRepoControls(next: TaskBridgeState, targetRepoId: string | null)
   set(hydratedRepoKey, repoKey)
 
   const profile = targetRepoId ? next.repoProfiles?.[targetRepoId] : undefined
-  const defaultAgent = profile?.defaultAgent ?? next.defaultAgent
+  const repoFile = targetRepoId ? next.repoConfigsByRepoId?.[targetRepoId] : undefined
+  const defaultAgent = profile?.defaultAgent ?? repoFile?.defaultAgent ?? next.defaultAgent
   if (defaultAgent) {
     set(selectedAgent, defaultAgent)
   }
-  set(requirePlanApprovalToggle, profile?.requirePlanApproval ?? next.requirePlanApproval)
-  set(enforcePlanLockToggle, profile?.enforcePlanLock ?? next.enforcePlanLock)
-  set(profileBranchTemplateInput, profile?.branchTemplate ?? (next.branchTemplate || '{prefix}/{key}-{slug}'))
-  set(profileFeaturePrefixInput, profile?.featurePrefix ?? (next.featurePrefix || 'feat'))
-  set(profileBugPrefixInput, profile?.bugPrefix ?? (next.bugPrefix || 'fix'))
-  set(profileChorePrefixInput, profile?.chorePrefix ?? (next.chorePrefix || 'chore'))
-  set(profileCopyFilesInput, (profile?.worktreeCopyFiles ?? next.worktreeCopyFiles ?? []).join(', '))
+  set(
+    requirePlanApprovalToggle,
+    profile?.requirePlanApproval ?? repoFile?.requirePlanApproval ?? next.requirePlanApproval
+  )
+  set(
+    enforcePlanLockToggle,
+    profile?.enforcePlanLock ?? repoFile?.enforcePlanLock ?? next.enforcePlanLock
+  )
+  set(
+    profileBranchTemplateInput,
+    profile?.branchTemplate ?? repoFile?.branchTemplate ?? (next.branchTemplate || '{prefix}/{key}-{slug}')
+  )
+  set(
+    profileFeaturePrefixInput,
+    profile?.featurePrefix ?? repoFile?.featurePrefix ?? (next.featurePrefix || 'feat')
+  )
+  set(
+    profileBugPrefixInput,
+    profile?.bugPrefix ?? repoFile?.bugPrefix ?? (next.bugPrefix || 'fix')
+  )
+  set(
+    profileChorePrefixInput,
+    profile?.chorePrefix ?? repoFile?.chorePrefix ?? (next.chorePrefix || 'chore')
+  )
+  set(
+    profileCopyFilesInput,
+    (profile?.worktreeCopyFiles ?? repoFile?.worktreeCopyFiles ?? next.worktreeCopyFiles ?? []).join(', ')
+  )
   set(profileTicketPrefixesInput, (profile?.ticketPrefixes ?? []).join(', '))
 }
 
@@ -342,12 +367,16 @@ async function handleWorkbenchDispatch(): Promise<void> {
   const task = state.tasks.find((t) => t.id === currentId)
   const targetRepo = task ? resolveTaskRepoInfo(state, task) : null
   const customBranch = read(branchOverride).trim()
+  const branchPrefixChoice = read(selectedBranchTypePrefix)
   try {
     const res = await plugin.request('tasks.dispatch', {
       taskId: currentId,
       agent: read(selectedAgent),
       ...(targetRepo?.repoId ? { repoId: targetRepo.repoId } : {}),
       ...(customBranch ? { customBranch } : {}),
+      ...(branchPrefixChoice && branchPrefixChoice !== '__auto__'
+        ? { branchPrefixOverride: branchPrefixChoice }
+        : {}),
       createWorktree: read(createWorktreeToggle),
       requirePlanApproval: read(requirePlanApprovalToggle),
       enforcePlanLock: read(enforcePlanLockToggle)
@@ -417,6 +446,18 @@ async function handleSendCommentFeedback(taskId: string): Promise<void> {
     ...(customInstruction ? { customInstruction } : {})
   })
   set(commentFeedbackInput, '')
+  applyIncomingState(res.state)
+  set(statusMessage, { text: res.summary, tone: 'success' })
+}
+
+async function handleSendPrFeedback(taskId: string): Promise<void> {
+  const res = await plugin.request('tasks.sendPrFeedback', { taskId })
+  applyIncomingState(res.state)
+  set(statusMessage, { text: res.summary, tone: 'success' })
+}
+
+async function handleApproveRepoSetup(repoId: string, configHash: string): Promise<void> {
+  const res = await plugin.request('tasks.approveRepoSetup', { repoId, configHash })
   applyIncomingState(res.state)
   set(statusMessage, { text: res.summary, tone: 'success' })
 }
@@ -648,9 +689,27 @@ export default function Panel() {
     state,
     selectedTaskRepo?.repoId ?? state.activeRepoId ?? undefined
   )
+  const branchPrefixChoice = read(selectedBranchTypePrefix)
   const effectiveBranch = selectedTask
-    ? read(branchOverride).trim() || buildBranchName(selectedTask, activeBranchConfig)
+    ? read(branchOverride).trim() ||
+      buildBranchName(
+        selectedTask,
+        activeBranchConfig,
+        branchPrefixChoice && branchPrefixChoice !== '__auto__' ? branchPrefixChoice : undefined
+      )
     : ''
+  const workbenchRepoConfig = workbenchRepoCtx.repoId
+    ? state.repoConfigsByRepoId?.[workbenchRepoCtx.repoId]
+    : undefined
+  const workbenchRepoSources = workbenchRepoCtx.repoId
+    ? state.repoConfigSourcesByRepoId?.[workbenchRepoCtx.repoId]
+    : undefined
+  const workbenchSetupApproval = workbenchRepoCtx.repoId
+    ? state.repoSetupApprovals?.find((a) => a.repoId === workbenchRepoCtx.repoId)
+    : undefined
+  const workbenchSkills = workbenchRepoCtx.repoId
+    ? (state.discoveredSkillsByRepoId?.[workbenchRepoCtx.repoId] ?? [])
+    : []
   const agentOptions = state.availableAgents?.length
     ? state.availableAgents
     : INITIAL_STATE.availableAgents
@@ -1015,6 +1074,9 @@ export default function Panel() {
                       {item.unreadCommentsCount > 0 ? (
                         <Badge tone="warning">{`${item.unreadCommentsCount} new comments`}</Badge>
                       ) : null}
+                      {(item.unresolvedPrCommentsCount ?? 0) > 0 ? (
+                        <Badge tone="warning">{`${item.unresolvedPrCommentsCount} PR comments`}</Badge>
+                      ) : null}
                       {item.detectedPrUrl ? <Badge tone="accent">PR Ready</Badge> : null}
                     </Row>
 
@@ -1039,6 +1101,17 @@ export default function Panel() {
                           onPress={() => handleSendCommentFeedback(item.taskId)}
                         >
                           {`Send Comments ${item.key}`}
+                        </Button>
+                      ) : null}
+                      {(item.unresolvedPrCommentsCount ?? 0) > 0 ? (
+                        <Button
+                          size="xs"
+                          variant="outline"
+                          tone="warning"
+                          icon="zap"
+                          onPress={() => handleSendPrFeedback(item.taskId)}
+                        >
+                          {`Send PR Feedback ${item.key}`}
                         </Button>
                       ) : null}
                       <Button
@@ -1202,6 +1275,21 @@ export default function Panel() {
                     </Text>
                   ) : null}
 
+                  {activeBranchConfig.branchTypes && activeBranchConfig.branchTypes.length > 0 ? (
+                    <Select
+                      label="Branch Type"
+                      value={read(selectedBranchTypePrefix)}
+                      onChange={(val) => set(selectedBranchTypePrefix, val)}
+                      options={[
+                        { value: '__auto__', label: 'Auto (ticket type / keywords)' },
+                        ...activeBranchConfig.branchTypes.map((bt) => ({
+                          value: bt.prefix,
+                          label: bt.prefix
+                        }))
+                      ]}
+                    />
+                  ) : null}
+
                   <Input
                     label="Custom Branch Override"
                     placeholder={buildBranchName(selectedTask, activeBranchConfig)}
@@ -1297,6 +1385,71 @@ export default function Panel() {
                       No CLAUDE.md, AGENTS.md, or PR template detected in the selected repository yet.
                     </Text>
                   )}
+
+                  {workbenchRepoConfig || workbenchRepoSources ? (
+                    <Row gap="xs" wrap>
+                      {workbenchRepoConfig ? (
+                        <Badge tone="accent">.task-bridge.json loaded</Badge>
+                      ) : null}
+                      {workbenchRepoSources?.branchTemplate ? (
+                        <Badge tone="neutral">{`Branch: ${workbenchRepoSources.branchTemplate}`}</Badge>
+                      ) : null}
+                      {workbenchRepoConfig?.planGate ? (
+                        <Badge tone="neutral">{`Plan Gate: ${workbenchRepoConfig.planGate}`}</Badge>
+                      ) : null}
+                      {workbenchRepoConfig?.subtaskBase && workbenchRepoConfig.subtaskBase !== 'default' ? (
+                        <Badge tone="neutral">{`Subtasks: ${workbenchRepoConfig.subtaskBase}`}</Badge>
+                      ) : null}
+                    </Row>
+                  ) : null}
+
+                  {workbenchSetupApproval ? (
+                    <Callout
+                      tone={workbenchSetupApproval.approved ? 'success' : 'warning'}
+                      title={
+                        workbenchSetupApproval.approved
+                          ? 'Worktree Setup Commands Approved'
+                          : 'Worktree Setup Commands Require Approval'
+                      }
+                    >
+                      <Stack gap="xs">
+                        <Text size="xs">
+                          {`Commands: ${workbenchSetupApproval.commands.join(' · ')}`}
+                        </Text>
+                        {!workbenchSetupApproval.approved ? (
+                          <Button
+                            size="xs"
+                            variant="solid"
+                            tone="warning"
+                            icon="check"
+                            onPress={() =>
+                              handleApproveRepoSetup(
+                                workbenchSetupApproval.repoId,
+                                workbenchSetupApproval.configHash
+                              )
+                            }
+                          >
+                            Approve Setup Commands
+                          </Button>
+                        ) : null}
+                      </Stack>
+                    </Callout>
+                  ) : null}
+
+                  {workbenchSkills.length > 0 ? (
+                    <Stack gap="none">
+                      <Text size="xs" weight="medium">
+                        {`Discovered Repo Skills (${workbenchSkills.length})`}
+                      </Text>
+                      <Row gap="xs" wrap>
+                        {workbenchSkills.slice(0, 8).map((s) => (
+                          <Badge key={s.relativePath} tone="neutral">
+                            {`${s.name} (${s.sourceDir})`}
+                          </Badge>
+                        ))}
+                      </Row>
+                    </Stack>
+                  ) : null}
 
                   <Input
                     label="Branch Template ({prefix}, {key}, {KEY}, {slug}, {project})"

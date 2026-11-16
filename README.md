@@ -146,6 +146,17 @@ Task Bridge is engineered from the ground up so it cannot compromise developer m
 
 ---
 
+## Repository Configuration (`.task-bridge.json`)
+
+Repositories can commit an optional `.task-bridge.json` at the repo root to share team conventions across developers (`defaults < .task-bridge.json < user RepoProfile overrides`):
+
+- **Branch naming & type rules**: `branchTemplate`, `featurePrefix`, `bugPrefix`, `chorePrefix`, and `branchTypes` (`prefix`, `keywords`, `issueTypes`).
+- **Custom ticket parsing & statuses**: `acceptanceCriteriaHeadings` and `statusAliases` (`inProgress`, `inReview`, `done`).
+- **Worktree setup & subtasks**: `worktreeCopyFiles`, allowlisted `worktreeSetupCommands` (e.g. `npm ci`, `pnpm install --frozen-lockfile`, `composer install`, `uv sync` — gated behind explicit SHA-256 hash approval in Workbench), and `subtaskBase` (`"default" | "parent" | "chain"`).
+- **Workflow skills & guards**: `workflow` phase skill mappings (`dispatch`, `verify`, `feedback`, `prFeedback`), `planGate` (`"plugin" | "skill" | "both"`), and `guard.denyGitWrites` (blocks specific `git` subcommands like `push` across agents).
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause & Fix |
