@@ -1000,6 +1000,10 @@ export default function Panel() {
                       ) : null}
                       {item.acVerificationStatus === 'verified' ? (
                         <Badge tone="success">AC Verified</Badge>
+                      ) : item.acVerificationStatus === 'failed' ? (
+                        <Badge tone="danger">AC Failed</Badge>
+                      ) : item.acVerificationStatus === 'unknown' ? (
+                        <Badge tone="neutral">AC Unknown</Badge>
                       ) : item.acVerificationStatus === 'running' ? (
                         <Badge tone="warning">Verifying AC…</Badge>
                       ) : null}

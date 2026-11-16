@@ -28,7 +28,7 @@ const SECRET_PATTERNS: readonly RegExp[] = [
 ]
 
 const ALLOWED_AGENTS = new Set(['antigravity', 'claude', 'codex', 'gemini', 'cursor'])
-const TICKET_KEY_REGEX = /^[A-Z0-9]{1,12}-[A-Z0-9]{1,12}$/
+const TICKET_KEY_REGEX = /^[A-Z][A-Z0-9_]{0,11}-[A-Z0-9]{1,12}$/
 const SAFE_BRANCH_REGEX = /^[A-Za-z0-9]+(?:[._/-][A-Za-z0-9]+)*$/
 const SAFE_PREFIX_REGEX = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,23}$/
 const NOTION_ID_REGEX =
@@ -517,4 +517,41 @@ export function isPlanLockToolAllowed(agentName: string, toolName: string, input
     return isReadOnlyShellCommand(extractCommandTextForPlanLock(input))
   }
   return false
+}
+
+const AC_VERDICT_WRITE_TOOLS = new Set([
+  'write',
+  'write_file',
+  'write_to_file',
+  'create_file'
+])
+
+/**
+ * Allows an AC Reviewer session to write ONLY its `.orca/task-bridge/ac-<KEY>.json` verdict file.
+ */
+export function isAcReviewerVerdictWrite(
+  toolName: string,
+  input: unknown,
+  expectedTicketKey: string
+): boolean {
+  if (!AC_VERDICT_WRITE_TOOLS.has(toolName.trim().toLowerCase())) return false
+  if (!input || typeof input !== 'object') return false
+  const obj = input as Record<string, unknown>
+  const rawPath =
+    typeof obj.file_path === 'string'
+      ? obj.file_path
+      : typeof obj.path === 'string'
+        ? obj.path
+        : typeof obj.TargetFile === 'string'
+          ? obj.TargetFile
+          : typeof obj.target_file === 'string'
+            ? obj.target_file
+            : ''
+  const rel = validateRelativeRepoPath(rawPath)
+  const safeKey = validateTicketKey(expectedTicketKey)
+  if (!rel || !safeKey) return false
+  return (
+    rel.toLowerCase() === `.orca/task-bridge/ac-${safeKey.toLowerCase()}.json` ||
+    rel.toLowerCase().endsWith(`/.orca/task-bridge/ac-${safeKey.toLowerCase()}.json`)
+  )
 }

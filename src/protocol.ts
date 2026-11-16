@@ -13,7 +13,7 @@ export type TaskPriority = 'urgent' | 'high' | 'medium' | 'low' | 'none'
 export type TaskKind = 'feature' | 'bug' | 'chore'
 export type TaskScopeFilter = 'assigned' | 'reported' | 'all' | 'done'
 export type LiveAgentState = 'idle' | 'working' | 'waiting' | 'blocked' | 'done'
-export type AcVerificationStatus = 'unverified' | 'running' | 'verified'
+export type AcVerificationStatus = 'unverified' | 'running' | 'verified' | 'failed' | 'unknown'
 export type PlanApprovalStatus = 'not_required' | 'awaiting_approval' | 'approved'
 
 export interface BranchNamingConfig {
@@ -322,6 +322,7 @@ export interface SaveRepoProfileOutput {
 export interface SendCommentFeedbackInput {
   taskId: string
   customInstruction?: string
+  confirmNewSession?: boolean
 }
 
 export interface SendCommentFeedbackOutput {
@@ -592,7 +593,7 @@ export function buildAcVerificationPrompt(task: TaskItem, branch: string): strin
     `# Acceptance Criteria Verification Gate: [${safeKey}]`,
     '',
     `You are acting as an independent, read-only **Reviewer Agent** for branch \`${safeBranch}\`.`,
-    'Do NOT modify production files. Inspect `git status`, `git diff`, and run the relevant unit tests.',
+    'Do NOT modify production or test source files, and do NOT stage `.orca/task-bridge/`. Inspect `git status`, `git diff`, and run the relevant unit tests.',
     '',
     '<untrusted_ticket_data>',
     `## Ticket: ${safeTitle}`,
@@ -601,10 +602,18 @@ export function buildAcVerificationPrompt(task: TaskItem, branch: string): strin
     '</untrusted_ticket_data>',
     '',
     '## Required Output',
-    'Produce a concise Markdown verification report with a table:',
-    '| # | Acceptance Criterion | Result (PASS / FAIL) | Evidence (File/Test) |',
-    '|---|---|---|---|',
-    'End with `VERDICT: READY_FOR_REVIEW` if all criteria pass, or `VERDICT: CHANGES_REQUIRED` with specific blockers.'
+    '1. Write a JSON verdict file to `.orca/task-bridge/ac-' + safeKey + '.json` with this exact structure:',
+    '```json',
+    '{',
+    '  "verdict": "READY_FOR_REVIEW",',
+    '  "summary": "Concise verification summary",',
+    '  "items": [',
+    '    { "criterion": "Criterion text", "result": "PASS", "evidence": "file:line or test name" }',
+    '  ]',
+    '}',
+    '```',
+    'Use `"verdict": "CHANGES_REQUIRED"` (and `"result": "FAIL"` on failing items) if anything is missing or tests fail.',
+    '2. Also output a concise Markdown verification table ending with `VERDICT: READY_FOR_REVIEW` or `VERDICT: CHANGES_REQUIRED`.'
   ].join('\n')
 }
 

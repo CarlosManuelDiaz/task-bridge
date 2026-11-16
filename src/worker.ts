@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs'
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type { JsonValue, OrcaWorkerApi } from 'orca/worker'
@@ -53,6 +53,7 @@ import {
 } from './protocol'
 import {
   doesBranchMatchTicketKey,
+  isAcReviewerVerdictWrite,
   isPlanLockToolAllowed,
   redactSecrets,
   sanitizeBranchPrefix,
@@ -252,6 +253,23 @@ export function mapStatusToCategory(
   const normalized = statusName.trim().toLowerCase()
   const hint = (categoryHint ?? '').trim().toLowerCase()
 
+  // Explicit Todo / unstarted phrases take precedence before checking "started" / "listo"
+  if (
+    /\b(not[\s_-]+started|sin[\s_-]+empezar|por[\s_-]+hacer|to[\s_-]+do|todo)\b/.test(normalized) ||
+    /\b(listo|lista)[\s_-]+para\b/.test(normalized)
+  ) {
+    return 'todo'
+  }
+
+  // Review keywords override ambiguous provider hints (Linear `started` / Jira `indeterminate`)
+  if (
+    /\b(in[\s_-]+review|code[\s_-]+review|peer[\s_-]+review|under[\s_-]+review|ready[\s_-]+for[\s_-]+review|awaiting[\s_-]+review|en[\s_-]+revisi[oó]n|revisi[oó]n(?:[\s_-]+de[\s_-]+c[oó]digo)?|review|qa|testing|verification|pull[\s_-]+request|pr[\s_-]+open|pr[\s_-]+ready)\b/.test(
+      normalized
+    )
+  ) {
+    return 'in_review'
+  }
+
   if (hint === 'completed' || hint === 'done' || hint === 'canceled' || hint === 'cancelled') {
     return 'done'
   }
@@ -260,19 +278,12 @@ export function mapStatusToCategory(
   }
 
   if (
-    /\b(done|complete|completed|closed|resolved|merged|shipped|released|canceled|cancelled|listo|lista|completado|completada|hecho|cancelado|cancelada)\b/.test(
+    /\b(done|complete|completed|closed|resolved|merged|shipped|released|canceled|cancelled|completado|completada|hecho|finalizado|finalizada|cancelado|cancelada)\b/.test(
       normalized
-    )
+    ) ||
+    /^(listo|lista)$/.test(normalized)
   ) {
     return 'done'
-  }
-
-  if (
-    /\b(in[\s_-]+review|code[\s_-]+review|peer[\s_-]+review|under[\s_-]+review|ready[\s_-]+for[\s_-]+review|awaiting[\s_-]+review|en[\s_-]+revisi[oó]n|review|qa|testing|verification|pull[\s_-]+request|pr[\s_-]+open|pr[\s_-]+ready)\b/.test(
-      normalized
-    )
-  ) {
-    return 'in_review'
   }
 
   if (
@@ -314,18 +325,27 @@ function mapPriority(raw: unknown): TaskPriority {
 export const PLUGIN_VERSION = '0.1.1'
 
 export function mapIssueKind(issueType: string, title: string): TaskKind {
-  const typeLower = issueType.toLowerCase()
-  const titleLower = title.toLowerCase()
-  const combined = `${typeLower} ${titleLower}`
-  if (
-    /\b(bug|defect|incident|error|incidencia|fallo|aver[ií]a)\b/.test(typeLower) ||
-    /\b(bug|fix|defect|incident|hotfix|regression|crash|incidencia|fallo)\b/.test(combined)
-  ) {
+  const typeLower = issueType.trim().toLowerCase()
+  const titleLower = title.trim().toLowerCase()
+
+  // Respect explicit issue types first (Story/Feature stays 'feature' even if title says "Build export page")
+  if (/\b(bug|defect|incident|error|incidencia|fallo|aver[ií]a)\b/.test(typeLower)) {
+    return 'bug'
+  }
+  if (/\b(story|feature|epic|enhancement|historia|mejora|funcionalidad)\b/.test(typeLower)) {
+    return 'feature'
+  }
+  if (/\b(chore|maintenance|refactor|mantenimiento|limpieza)\b/.test(typeLower)) {
+    return 'chore'
+  }
+
+  // Generic types (Task, Tarea, Issue, Sub-task, '') inspect title keywords
+  if (/\b(bug|fix|defect|incident|hotfix|regression|crash|incidencia|fallo)\b/.test(titleLower)) {
     return 'bug'
   }
   if (
     /\b(chore|refactor|cleanup|docs|ci|build|deps|maintenance|mantenimiento|limpieza|documentaci[oó]n|t[eé]cnic[oa])\b/.test(
-      combined
+      titleLower
     )
   ) {
     return 'chore'
@@ -387,9 +407,57 @@ function extractPersonName(raw: unknown, fallback: string): string {
   return text || fallback
 }
 
+const AC_HEADING_REGEX =
+  /^(?:#{1,6}\s*|h[1-6]\.\s*|\*{2})?(?:acceptance criteria|criterios de aceptaci[oó]n|crit[eè]res d['’]acceptation|akzeptanzkriterien)(?:\*{2})?\s*:?\s*$/i
+
+function isSectionHeadingBoundary(trimmed: string): boolean {
+  if (!trimmed) return false
+  if (/^(?:[-*+]|\d+[.)])\s+/.test(trimmed)) return false
+  if (/^#{1,6}\s+/.test(trimmed)) return true
+  if (/^h[1-6]\.\s+/i.test(trimmed)) return true
+  if (/^\*\*[^*\n]{2,80}\*\*:?\s*$/.test(trimmed)) return true
+  if (/^[A-Za-z\u00C0-\u017F][A-Za-z0-9\u00C0-\u017F\s/_-]{1,50}:\s*$/.test(trimmed)) return true
+  return false
+}
+
+/**
+ * Extracts plain readable Markdown/text from a raw string or Jira Cloud Atlassian Document Format (ADF) object.
+ */
+export function extractPlainTextFromDescription(rawDesc: unknown): string {
+  if (typeof rawDesc === 'string') return rawDesc
+  if (!rawDesc || typeof rawDesc !== 'object') return ''
+
+  const walkNode = (node: unknown): string => {
+    if (typeof node === 'string') return node
+    if (!node || typeof node !== 'object') return ''
+    if (Array.isArray(node)) return node.map(walkNode).join('')
+    const obj = node as Record<string, unknown>
+    const nodeType = typeof obj.type === 'string' ? obj.type : ''
+    if (nodeType === 'text' && typeof obj.text === 'string') {
+      return obj.text
+    }
+    if (nodeType === 'hardBreak') return '\n'
+    const childrenText = Array.isArray(obj.content) ? obj.content.map(walkNode).join('') : ''
+    if (nodeType === 'listItem') {
+      return `- ${childrenText.trim()}\n`
+    }
+    if (nodeType === 'heading') {
+      const attrs = obj.attrs && typeof obj.attrs === 'object' ? (obj.attrs as Record<string, unknown>) : null
+      const level = typeof attrs?.level === 'number' ? Math.min(Math.max(attrs.level, 1), 6) : 2
+      return `${'#'.repeat(level)} ${childrenText.trim()}\n`
+    }
+    if (nodeType === 'paragraph' || nodeType === 'blockquote' || nodeType === 'codeBlock') {
+      return childrenText.trim() ? `${childrenText.trim()}\n` : '\n'
+    }
+    return childrenText
+  }
+
+  return walkNode(rawDesc).trim()
+}
+
 /**
  * Extracts structured Acceptance Criteria items from Markdown task checkboxes
- * (`- [ ] ...`) or list items inside an `Acceptance Criteria` section.
+ * (`- [ ] ...`) or list items inside an `Acceptance Criteria` (or localized) section.
  */
 export function extractAcceptanceCriteriaFromText(text: string): string[] {
   if (!text) return []
@@ -406,12 +474,12 @@ export function extractAcceptanceCriteriaFromText(text: string): string[] {
       if (cleaned) checkboxItems.push(cleaned)
     }
 
-    if (/^#{1,4}\s*acceptance criteria\b/i.test(trimmed) || /^acceptance criteria\s*:/i.test(trimmed)) {
+    if (AC_HEADING_REGEX.test(trimmed)) {
       inAcSection = true
       continue
     }
     if (inAcSection) {
-      if (/^#{1,6}\s+/.test(trimmed)) {
+      if (isSectionHeadingBoundary(trimmed)) {
         inAcSection = false
         continue
       }
@@ -443,7 +511,12 @@ export function parseLinearTasksResult(result: unknown): TaskItem[] {
     } else if (Array.isArray(obj.items)) {
       rows = obj.items as unknown[]
     } else if (obj.issue && typeof obj.issue === 'object' && !Array.isArray(obj.issue)) {
-      rows = [{ ...(obj.issue as Record<string, unknown>), children: obj.children }]
+      rows = [
+        {
+          ...(obj.issue as Record<string, unknown>),
+          ...(obj.children !== undefined ? { children: obj.children } : {})
+        }
+      ]
     }
   }
 
@@ -457,8 +530,9 @@ export function parseLinearTasksResult(result: unknown): TaskItem[] {
     if (!key) continue
 
     const title = sanitizeUntrustedText(String(row.title ?? key), 200) || key
-    const description = sanitizeUntrustedText(String(row.description ?? ''), 3000)
-    const acceptanceCriteria = extractAcceptanceCriteriaFromText(description)
+    const rawDescriptionText = extractPlainTextFromDescription(row.description)
+    const acceptanceCriteria = extractAcceptanceCriteriaFromText(rawDescriptionText)
+    const description = sanitizeUntrustedText(rawDescriptionText, 3000)
 
     const stateObj =
       row.state && typeof row.state === 'object'
@@ -709,7 +783,9 @@ async function fetchJiraTasksWithHierarchy(
 
   const byKey = new Map(items.map((t) => [t.key, t]))
   const needDetails = [
-    ...items.filter((t) => !t.description && t.statusCategory !== 'done'),
+    ...items.filter(
+      (t) => t.statusCategory !== 'done' && (!t.description || (!t.parent && (!t.children || t.children.length === 0)))
+    ),
     ...items.filter((t) => !t.description && t.statusCategory === 'done')
   ].slice(0, 15)
 
@@ -778,8 +854,9 @@ export function parseJiraTasksResult(result: unknown, siteId?: string | null): T
     if (!key) continue
 
     const title = sanitizeUntrustedText(String(row.title ?? row.summary ?? key), 200) || key
-    const description = sanitizeUntrustedText(String(row.description ?? ''), 3000)
-    const acceptanceCriteria = extractAcceptanceCriteriaFromText(description)
+    const rawDescriptionText = extractPlainTextFromDescription(row.description)
+    const acceptanceCriteria = extractAcceptanceCriteriaFromText(rawDescriptionText)
+    const description = sanitizeUntrustedText(rawDescriptionText, 3000)
 
     const statusObj =
       row.status && typeof row.status === 'object'
@@ -1117,12 +1194,27 @@ export function runOrcaCli(
  * Executes a read-only Git or GitHub CLI command inside a specific repository worktree path
  * using `execFile` with explicit argument arrays (zero shell interpolation).
  */
+export type RepoToolRunner = (
+  executable: 'git' | 'gh',
+  args: readonly string[],
+  cwd: string
+) => Promise<string | null>
+
+let customRepoToolRunnerForTests: RepoToolRunner | null = null
+
+export function setRepoToolRunnerForTests(runner: RepoToolRunner | null): void {
+  customRepoToolRunnerForTests = runner
+}
+
 function runRepoTool(
   executable: 'git' | 'gh',
   args: readonly string[],
   cwd: string,
   signal?: AbortSignal
 ): Promise<string | null> {
+  if (customRepoToolRunnerForTests) {
+    return customRepoToolRunnerForTests(executable, args, cwd)
+  }
   if (process.env.NODE_TEST_CONTEXT && !customCliRunnerForTests) {
     return Promise.resolve(null)
   }
@@ -1300,6 +1392,17 @@ async function fetchNotionTasks(
   })
 }
 
+async function parseNotionErrorMessage(res: Response): Promise<string> {
+  try {
+    const raw = await res.text()
+    const parsed = JSON.parse(raw) as { code?: string; message?: string }
+    const msg = [parsed.code, parsed.message].filter(Boolean).join(': ') || raw
+    return redactSecrets(sanitizeUntrustedText(`HTTP ${res.status} — ${msg}`, 200))
+  } catch {
+    return `HTTP ${res.status}`
+  }
+}
+
 async function syncNotionStatusAndComment(options: {
   notionToken: string
   pageId: string
@@ -1307,9 +1410,11 @@ async function syncNotionStatusAndComment(options: {
   propType?: 'status' | 'select'
   nextStatus: string
   commentBody?: string
-}): Promise<boolean> {
+}): Promise<{ ok: boolean; error?: string }> {
   const safePageId = validateNotionId(options.pageId)
-  if (typeof fetch !== 'function' || !options.notionToken || !safePageId) return false
+  if (typeof fetch !== 'function' || !options.notionToken || !safePageId) {
+    return { ok: false, error: 'Missing Notion token or valid page ID.' }
+  }
 
   const headers = {
     Authorization: `Bearer ${options.notionToken}`,
@@ -1318,7 +1423,7 @@ async function syncNotionStatusAndComment(options: {
   }
 
   const primaryType = options.propType === 'select' ? 'select' : 'status'
-  const patchRes = await fetch(`https://api.notion.com/v1/pages/${encodeURIComponent(safePageId)}`, {
+  let effectiveRes = await fetch(`https://api.notion.com/v1/pages/${encodeURIComponent(safePageId)}`, {
     method: 'PATCH',
     headers,
     body: JSON.stringify({
@@ -1331,9 +1436,9 @@ async function syncNotionStatusAndComment(options: {
   })
 
   // Automatic fallback if the database property uses `select` instead of `status` (or vice-versa)
-  if (!patchRes.ok && patchRes.status === 400) {
+  if (!effectiveRes.ok && effectiveRes.status === 400) {
     const fallbackType = primaryType === 'status' ? 'select' : 'status'
-    await fetch(`https://api.notion.com/v1/pages/${encodeURIComponent(safePageId)}`, {
+    effectiveRes = await fetch(`https://api.notion.com/v1/pages/${encodeURIComponent(safePageId)}`, {
       method: 'PATCH',
       headers,
       body: JSON.stringify({
@@ -1346,9 +1451,13 @@ async function syncNotionStatusAndComment(options: {
     })
   }
 
+  if (!effectiveRes.ok) {
+    return { ok: false, error: await parseNotionErrorMessage(effectiveRes) }
+  }
+
   const cleanComment = sanitizeUntrustedText(options.commentBody ?? '', 1000)
   if (cleanComment) {
-    await fetch('https://api.notion.com/v1/comments', {
+    const commentRes = await fetch('https://api.notion.com/v1/comments', {
       method: 'POST',
       headers,
       body: JSON.stringify({
@@ -1356,8 +1465,11 @@ async function syncNotionStatusAndComment(options: {
         rich_text: [{ type: 'text', text: { content: cleanComment } }]
       })
     })
+    if (!commentRes.ok) {
+      return { ok: false, error: await parseNotionErrorMessage(commentRes) }
+    }
   }
-  return true
+  return { ok: true }
 }
 
 /**
@@ -1414,6 +1526,9 @@ export async function syncProviderTransition(options: {
       return { providerSynced: true, resolvedStatus: fallbackStatus }
     }
 
+    const isCanceledOrRejectedName = (name: string) =>
+      /\b(cancel|cancelled|canceled|won.?t|reject|rejected|descart|duplicate|obsolete)\b/i.test(name)
+
     // Dynamic fallback if Linear returns `linear_invalid_state` with `error.data.states`
     const errObj =
       ans.error && typeof ans.error === 'object' ? (ans.error as Record<string, unknown>) : null
@@ -1422,12 +1537,20 @@ export async function syncProviderTransition(options: {
         ? (errObj.data as Record<string, unknown>)
         : null
     if (Array.isArray(dataObj?.states)) {
-      const candidate = dataObj.states.find((s): s is Record<string, unknown> => {
+      const candidates = dataObj.states.filter((s): s is Record<string, unknown> => {
         if (!s || typeof s !== 'object') return false
         const sName = String((s as Record<string, unknown>).name ?? '')
-        const sType = String((s as Record<string, unknown>).type ?? '')
+        const sType = String((s as Record<string, unknown>).type ?? '').toLowerCase()
+        if (targetCategory === 'done' && (sType === 'canceled' || sType === 'cancelled' || isCanceledOrRejectedName(sName))) {
+          return false
+        }
         return mapStatusToCategory(sName, sType) === targetCategory
       })
+      const preferredNames = new Set(['done', 'hecho', 'finalizada', 'finalizado', 'completed'])
+      const candidate =
+        (targetCategory === 'done'
+          ? candidates.find((s) => preferredNames.has(String(s.name ?? '').trim().toLowerCase()))
+          : undefined) ?? candidates[0]
       if (candidate && typeof candidate.name === 'string') {
         const retryName = sanitizeUntrustedText(candidate.name, 60)
         const retryAns = await runOrcaCli(
@@ -1470,17 +1593,39 @@ export async function syncProviderTransition(options: {
           ? ((listAns.result as Record<string, unknown>).transitions as unknown[])
           : []
 
+      const isCanceledTransition = (name: string) =>
+        /\b(cancel|cancelled|canceled|won.?t|reject|rejected|descart|duplicate|obsolete)\b/i.test(name)
+      const preferredDoneNames = new Set(['done', 'hecho', 'finalizada', 'finalizado', 'completed'])
+
+      const matching: Array<{ id: string | null; name: string }> = []
       for (const rawT of rawTransitions) {
         if (!rawT || typeof rawT !== 'object') continue
         const tObj = rawT as Record<string, unknown>
         const toObj =
           tObj.to && typeof tObj.to === 'object' ? (tObj.to as Record<string, unknown>) : null
-        const candidateName = String(toObj?.name ?? tObj.name ?? '')
+        const candidateName = sanitizeUntrustedText(String(toObj?.name ?? tObj.name ?? ''), 60)
         const candidateCategory = String(toObj?.categoryKey ?? tObj.categoryKey ?? '')
         if (mapStatusToCategory(candidateName, candidateCategory) === targetCategory) {
-          if (tObj.id != null) targetTransitionId = String(tObj.id)
-          if (candidateName) resolvedName = sanitizeUntrustedText(candidateName, 60)
-          break
+          matching.push({
+            id: tObj.id != null ? String(tObj.id) : null,
+            name: candidateName
+          })
+        }
+      }
+
+      if (matching.length > 0) {
+        const nonCanceled =
+          targetCategory === 'done'
+            ? matching.filter((m) => !isCanceledTransition(m.name))
+            : matching
+        const pool = nonCanceled.length > 0 ? nonCanceled : matching
+        const picked =
+          (targetCategory === 'done'
+            ? pool.find((m) => preferredDoneNames.has(m.name.trim().toLowerCase()))
+            : undefined) ?? pool[0]
+        if (picked) {
+          targetTransitionId = picked.id
+          if (picked.name) resolvedName = picked.name
         }
       }
     }
@@ -1512,7 +1657,7 @@ export async function syncProviderTransition(options: {
 
   if (task.provider === 'notion' && task.externalWorkspaceId && options.notionToken) {
     try {
-      const ok = await syncNotionStatusAndComment({
+      const syncRes = await syncNotionStatusAndComment({
         notionToken: options.notionToken.trim(),
         pageId: task.externalWorkspaceId,
         statusProperty: options.notionStatusProperty,
@@ -1520,9 +1665,17 @@ export async function syncProviderTransition(options: {
         nextStatus: fallbackStatus,
         commentBody
       })
-      return { providerSynced: ok, resolvedStatus: ok ? fallbackStatus : task.status }
-    } catch {
-      return { providerSynced: false, resolvedStatus: task.status }
+      return {
+        providerSynced: syncRes.ok,
+        resolvedStatus: syncRes.ok ? fallbackStatus : task.status,
+        ...(syncRes.error ? { failureReason: syncRes.error } : {})
+      }
+    } catch (err) {
+      return {
+        providerSynced: false,
+        resolvedStatus: task.status,
+        failureReason: sanitizeUntrustedText(err instanceof Error ? err.message : String(err), 200)
+      }
     }
   }
 
@@ -1632,14 +1785,15 @@ export function scanRepoGuidelines(
   )
 
   let detectedBranchHint: string | undefined
-  if (/\bfeature\//i.test(combinedRaw)) {
-    detectedBranchHint = /\[A-Z\]|\{KEY\}|KEY|TICKET/.test(combinedRaw)
-      ? 'feature/{KEY}-{slug}'
-      : 'feature/{key}-{slug}'
-  } else if (/\bfeat\//i.test(combinedRaw)) {
-    detectedBranchHint = /\[A-Z\]|\{KEY\}|KEY|TICKET/.test(combinedRaw)
-      ? 'feat/{KEY}-{slug}'
-      : 'feat/{key}-{slug}'
+  const branchExampleMatch = /\b(feature|feat)\/([A-Za-z0-9_{}<>-]+)/i.exec(combinedRaw)
+  if (branchExampleMatch) {
+    const examplePrefix = branchExampleMatch[1].toLowerCase() === 'feature' ? 'feature' : 'feat'
+    const exampleSuffix = branchExampleMatch[2]
+    const usesUppercaseKey =
+      /\{KEY\}|\[A-Z\]|<KEY>|[A-Z]{2,}-\d+/.test(exampleSuffix)
+    detectedBranchHint = usesUppercaseKey
+      ? `${examplePrefix}/{KEY}-{slug}`
+      : `${examplePrefix}/{key}-{slug}`
   }
 
   return {
@@ -1827,6 +1981,75 @@ async function fetchTaskComments(
   return []
 }
 
+/**
+ * Safely reads `.orca/task-bridge/ac-<KEY>.json` inside a workspace worktree, refusing symlinks
+ * or path escapes and mapping missing/invalid verdict files cleanly to `'unknown'`.
+ */
+export function readAcVerdictFromWorkspace(
+  workspacePath: string | null | undefined,
+  ticketKey: string
+): { status: 'verified' | 'failed' | 'unknown'; summary: string } {
+  const safeKey = validateTicketKey(ticketKey)
+  if (!safeKey || !workspacePath || workspacePath === '.' || !existsSync(workspacePath)) {
+    return {
+      status: 'unknown',
+      summary: 'Reviewer finished, but workspace path was unavailable to read the verdict file.'
+    }
+  }
+  const relPath = `.orca/task-bridge/ac-${safeKey}.json`
+  try {
+    const realRoot = realpathSync(workspacePath)
+    const targetPath = path.resolve(realRoot, relPath)
+    const normRoot = process.platform === 'win32' ? realRoot.toLowerCase() : realRoot
+    const normTarget = process.platform === 'win32' ? targetPath.toLowerCase() : targetPath
+    if (!normTarget.startsWith(normRoot + path.sep) || !existsSync(targetPath)) {
+      return {
+        status: 'unknown',
+        summary: `Reviewer finished without writing ${relPath}. Verification status is unknown.`
+      }
+    }
+    const stat = lstatSync(targetPath)
+    if (stat.isSymbolicLink()) {
+      return {
+        status: 'unknown',
+        summary: `Refused symlinked verdict file ${relPath}.`
+      }
+    }
+    const realTarget = realpathSync(targetPath)
+    const normRealTarget = process.platform === 'win32' ? realTarget.toLowerCase() : realTarget
+    if (!normRealTarget.startsWith(normRoot + path.sep)) {
+      return {
+        status: 'unknown',
+        summary: `Refused out-of-workspace verdict file ${relPath}.`
+      }
+    }
+    const parsed = JSON.parse(readFileSync(realTarget, 'utf8')) as Record<string, unknown>
+    const rawVerdict = typeof parsed?.verdict === 'string' ? parsed.verdict.trim().toUpperCase() : ''
+    const rawSummary = sanitizeUntrustedText(String(parsed?.summary ?? ''), 240)
+    if (rawVerdict === 'READY_FOR_REVIEW') {
+      return {
+        status: 'verified',
+        summary: rawSummary || `All acceptance criteria verified for [${safeKey}].`
+      }
+    }
+    if (rawVerdict === 'CHANGES_REQUIRED') {
+      return {
+        status: 'failed',
+        summary: rawSummary || `Reviewer reported changes required for [${safeKey}].`
+      }
+    }
+    return {
+      status: 'unknown',
+      summary: `Unrecognized verdict in ${relPath}. Expected READY_FOR_REVIEW or CHANGES_REQUIRED.`
+    }
+  } catch {
+    return {
+      status: 'unknown',
+      summary: `Failed to parse ${relPath}; verification status is unknown.`
+    }
+  }
+}
+
 export default function activate(orca: OrcaWorkerApi): void {
   // In-memory demo tasks (never persisted to `orca.storage` so demo data never pollutes real queues)
   let inMemoryDemoTasks: TaskItem[] = DEFAULT_SEED_TASKS.map((t) => ({
@@ -1839,6 +2062,18 @@ export default function activate(orca: OrcaWorkerApi): void {
   // Fast lookup maps for multi-agent workspace/terminal correlation (Fixes Bug #5)
   const taskByTerminalId = new Map<string, TaskItem>()
   const taskByWorkspaceId = new Map<string, TaskItem>()
+  const acReviewerByTerminalId = new Map<string, TaskItem>()
+  const activeDispatches = new Set<string>()
+  let tasksMutexChain: Promise<void> = Promise.resolve()
+
+  function withTasksLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = tasksMutexChain.then(fn, fn)
+    tasksMutexChain = run.then(
+      () => undefined,
+      () => undefined
+    )
+    return run
+  }
   let cachedActiveTask: TaskItem | null = null
   let cachedFocusedTerminalIds = new Set<string>()
   let cachedInjectSkill = true
@@ -2078,6 +2313,7 @@ export default function activate(orca: OrcaWorkerApi): void {
   function rebuildLookupMaps(tasks: TaskItem[]): void {
     taskByTerminalId.clear()
     taskByWorkspaceId.clear()
+    acReviewerByTerminalId.clear()
     for (const t of tasks) {
       if (t.linkedTerminalId) {
         taskByTerminalId.set(t.linkedTerminalId, t)
@@ -2085,7 +2321,27 @@ export default function activate(orca: OrcaWorkerApi): void {
       if (t.linkedOrcaWorkspaceId) {
         taskByWorkspaceId.set(t.linkedOrcaWorkspaceId, t)
       }
+      if (t.acReviewerTerminalId) {
+        acReviewerByTerminalId.set(t.acReviewerTerminalId, t)
+      }
     }
+  }
+
+  async function patchTaskLocked(
+    taskId: string,
+    updater: (current: TaskItem) => TaskItem | null
+  ): Promise<TaskItem | null> {
+    return await withTasksLock(async () => {
+      const { tasks, isDemo } = await readEffectiveTasks()
+      const idx = tasks.findIndex((t) => t.id === taskId)
+      if (idx === -1) return null
+      const patched = updater(tasks[idx])
+      if (!patched) return tasks[idx]
+      const nextTasks = [...tasks]
+      nextTasks[idx] = patched
+      await saveEffectiveTasks(nextTasks, isDemo)
+      return patched
+    })
   }
 
   async function readStoredTasks(): Promise<TaskItem[]> {
@@ -2402,21 +2658,37 @@ export default function activate(orca: OrcaWorkerApi): void {
     }
 
     // Auto-link any manually created worktree whose branch matches a ticket key cleanly (boundary-checked)
-    let autoLinkedChanged = false
+    const autoLinksToApply: Array<{ taskId: string; branch: string; workspaceId: string }> = []
     for (const ws of workspaces) {
       if (!ws.branch) continue
       for (const task of tasks) {
         if (task.fleetDismissed) continue
         if (!task.linkedBranch && doesBranchMatchTicketKey(ws.branch, task.key)) {
-          task.linkedBranch = ws.branch
-          task.linkedOrcaWorkspaceId = ws.id
-          taskByWorkspaceId.set(ws.id, task)
-          autoLinkedChanged = true
+          autoLinksToApply.push({ taskId: task.id, branch: ws.branch, workspaceId: ws.id })
         }
       }
     }
-    if (autoLinkedChanged) {
-      await saveEffectiveTasks(tasks, isDemo)
+    if (autoLinksToApply.length > 0) {
+      await withTasksLock(async () => {
+        const latest = await readEffectiveTasks()
+        let changed = false
+        const nextTasks = latest.tasks.map((t) => {
+          const hit = autoLinksToApply.find((a) => a.taskId === t.id)
+          if (!hit || t.linkedBranch) return t
+          changed = true
+          return { ...t, linkedBranch: hit.branch, linkedOrcaWorkspaceId: hit.workspaceId }
+        })
+        if (changed) {
+          await saveEffectiveTasks(nextTasks, latest.isDemo)
+        }
+      })
+      for (const hit of autoLinksToApply) {
+        const idx = tasks.findIndex((t) => t.id === hit.taskId)
+        if (idx !== -1 && !tasks[idx].linkedBranch) {
+          tasks[idx] = { ...tasks[idx], linkedBranch: hit.branch, linkedOrcaWorkspaceId: hit.workspaceId }
+          taskByWorkspaceId.set(hit.workspaceId, tasks[idx])
+        }
+      }
     }
 
     // Live agents from focused workspace (`agents.list`)
@@ -2611,7 +2883,7 @@ export default function activate(orca: OrcaWorkerApi): void {
   async function detectPrForTask(
     task: TaskItem,
     signal?: AbortSignal
-  ): Promise<{ prUrl: string | null; commitSummary: string }> {
+  ): Promise<{ prUrl: string | null; commitSummary: string; hasNewActivity?: boolean }> {
     let repoPath: string | null = null
     try {
       const wsRes = await orca.host.call('workspace.list')
@@ -2630,6 +2902,7 @@ export default function activate(orca: OrcaWorkerApi): void {
 
     let prUrl: string | null = task.detectedPrUrl ?? null
     let commitSummary = task.detectedCommitSummary ?? ''
+    let hasNewActivity = false
 
     if (repoPath) {
       const ghOut = await runRepoTool(
@@ -2641,34 +2914,68 @@ export default function activate(orca: OrcaWorkerApi): void {
       if (ghOut) {
         try {
           const parsed = JSON.parse(ghOut) as Record<string, unknown>
+          const prState = String(parsed.state ?? '').trim().toUpperCase()
           const validUrl = validateHttpsUrl(parsed.url)
-          if (validUrl) prUrl = validUrl
-          if (typeof parsed.title === 'string' && parsed.title.trim()) {
-            commitSummary = sanitizeUntrustedText(parsed.title.trim(), 300)
+          if (prState === 'OPEN') {
+            if (validUrl) {
+              prUrl = validUrl
+              hasNewActivity = true
+            }
+            if (typeof parsed.title === 'string' && parsed.title.trim()) {
+              commitSummary = sanitizeUntrustedText(parsed.title.trim(), 300)
+            }
+          } else if (prState) {
+            // Do not attach merged/closed PRs from older identically named branches (F5)
+            prUrl = null
           }
         } catch {
           // Ignore invalid JSON
         }
       }
 
-      let gitOut = await runRepoTool('git', ['log', 'main..HEAD', '-n', '5', '--oneline'], repoPath, signal)
-      if (!gitOut) {
-        gitOut = await runRepoTool('git', ['log', 'master..HEAD', '-n', '5', '--oneline'], repoPath, signal)
+      let baseBranch: string | null = null
+      const originHeadOut = await runRepoTool(
+        'git',
+        ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'],
+        repoPath,
+        signal
+      )
+      if (originHeadOut) {
+        const candidateBase = originHeadOut.trim().replace(/^origin\//, '')
+        if (candidateBase) baseBranch = candidateBase
       }
-      if (!gitOut) {
-        gitOut = await runRepoTool('git', ['log', '-n', '3', '--oneline'], repoPath, signal)
+      if (!baseBranch) {
+        for (const fallbackBase of ['main', 'master']) {
+          const verified = await runRepoTool('git', ['rev-parse', '--verify', fallbackBase], repoPath, signal)
+          if (verified) {
+            baseBranch = fallbackBase
+            break
+          }
+        }
       }
-      if (gitOut) {
-        const cleanCommits = sanitizeUntrustedText(
-          gitOut
-            .split('\n')
-            .map((l) => l.trim())
-            .filter(Boolean)
-            .join('; '),
-          400
+
+      if (baseBranch) {
+        const gitOut = await runRepoTool(
+          'git',
+          ['log', `${baseBranch}..HEAD`, '-n', '5', '--oneline'],
+          repoPath,
+          signal
         )
-        if (cleanCommits) {
-          commitSummary = commitSummary ? `${commitSummary} (${cleanCommits})` : cleanCommits
+        if (gitOut) {
+          const cleanCommits = sanitizeUntrustedText(
+            gitOut
+              .split('\n')
+              .map((l) => l.trim())
+              .filter(Boolean)
+              .join('; '),
+            400
+          )
+          if (cleanCommits) {
+            commitSummary = commitSummary ? `${commitSummary} (${cleanCommits})` : cleanCommits
+            hasNewActivity = true
+          }
+        } else if (!commitSummary) {
+          commitSummary = `No commits yet ahead of ${baseBranch} for [${task.key}].`
         }
       }
     }
@@ -2677,7 +2984,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       commitSummary = `Completed implementation for [${task.key}] ${task.title}.`
     }
 
-    return { prUrl, commitSummary }
+    return { prUrl, commitSummary, hasNewActivity }
   }
 
   /**
@@ -2933,17 +3240,18 @@ export default function activate(orca: OrcaWorkerApi): void {
         if (handle) launchedTerminalId = handle
       }
 
-      // Re-read workspace list to locate the newly created worktree by id, path, branch, or name
+      // Re-read workspace list to locate the newly created worktree by id, path, or branch within target repo
       try {
         const wsListAfter = await orca.host.call('workspace.list')
         if (Array.isArray(wsListAfter?.workspaces)) {
           workspaces = wsListAfter.workspaces
+          const targetRepoFilter = repoId ?? preferredRepoId ?? null
           matchedWs = workspaces.find(
             (w) =>
               (createdId && (w.id === createdId || w.id.endsWith(createdId))) ||
               (createdPath && w.path === createdPath) ||
-              w.branch === branch ||
-              w.name === branch
+              ((!targetRepoFilter || (extractRepoId(w.id) ?? w.id) === targetRepoFilter) &&
+                (w.branch === branch || w.name === branch))
           )
           if (matchedWs) createdNewWorktree = true
         }
@@ -3003,6 +3311,46 @@ export default function activate(orca: OrcaWorkerApi): void {
     const targetWorkspaceId = matchedWs?.id ?? task.linkedOrcaWorkspaceId ?? null
 
     if (targetWorkspaceId) {
+      // Persist resolved workspace/branch/repo link BEFORE attempting agent launch so retries never duplicate the worktree
+      await patchTaskLocked(task.id, (current) => ({
+        ...current,
+        linkedBranch: branch,
+        linkedOrcaWorkspaceId: targetWorkspaceId,
+        ...(resolvedRepoId ? { repoId: resolvedRepoId } : {}),
+        ...(requirePlanApproval
+          ? { planApproved: current.planApproved === true ? true : false }
+          : {}),
+        planLockActive: Boolean(requirePlanApproval && enforcePlanLock && current.planApproved !== true),
+        updatedAt: Date.now()
+      }))
+
+      // Prevent duplicate launches when `agents.list` reports an active (`working` or `waiting`) agent on this task or focused target workspace
+      if (!agentLaunchedViaCli) {
+        const isTargetFocused = Boolean(focusedWorktree && focusedWorktree.id === targetWorkspaceId)
+        let liveWorkspaceAgents: Array<{ state?: string; terminalId?: string }> = []
+        try {
+          const agentsRes = await orca.host.call('agents.list')
+          if (Array.isArray(agentsRes?.agents)) {
+            liveWorkspaceAgents = agentsRes.agents
+          }
+        } catch {
+          // Ignore when agents.list is unavailable
+        }
+        const alreadyLive = liveWorkspaceAgents.find(
+          (ag) =>
+            (ag.state === 'working' || ag.state === 'waiting') &&
+            ((ag.terminalId && task.linkedTerminalId && ag.terminalId === task.linkedTerminalId) ||
+              isTargetFocused)
+        )
+        if (alreadyLive) {
+          const err = new Error(
+            `An agent is already ${alreadyLive.state} in workspace for [${safeKey}]. Open that workspace instead of launching a duplicate session.`
+          ) as Error & { code: string }
+          err.code = 'action_failed'
+          throw err
+        }
+      }
+
       // Rename the workspace in Orca's sidebar to `KEY · Title` (Quick Win #2)
       try {
         await orca.host.call('workspace.rename', {
@@ -3132,19 +3480,17 @@ export default function activate(orca: OrcaWorkerApi): void {
     // Demo tickets stay local and never issue provider API/CLI mutations
     if (existing.demo) {
       const resolvedStatus = statusLabelForCategory(input.targetCategory)
-      const updatedDemo: TaskItem = {
-        ...existing,
-        status: resolvedStatus,
-        statusCategory: input.targetCategory,
-        ...(safePrUrl ? { detectedPrUrl: safePrUrl } : {}),
-        ...(input.targetCategory === 'in_review' || input.targetCategory === 'done'
-          ? { agentState: 'done' as const }
-          : {}),
-        updatedAt: Date.now()
-      }
-      const nextTasks = [...tasks]
-      nextTasks[index] = updatedDemo
-      await saveEffectiveTasks(nextTasks, isDemo)
+      const updatedDemo =
+        (await patchTaskLocked(existing.id, (current) => ({
+          ...current,
+          status: resolvedStatus,
+          statusCategory: input.targetCategory,
+          ...(safePrUrl ? { detectedPrUrl: safePrUrl } : {}),
+          ...(input.targetCategory === 'in_review' || input.targetCategory === 'done'
+            ? { agentState: 'done' as const }
+            : {}),
+          updatedAt: Date.now()
+        }))) ?? existing
       const state = await broadcastState()
       return {
         state,
@@ -3166,9 +3512,11 @@ export default function activate(orca: OrcaWorkerApi): void {
       signal
     })
 
-    const updatedTask: TaskItem = transResult.providerSynced
-      ? {
-          ...existing,
+    let updatedTask: TaskItem = existing
+    if (transResult.providerSynced) {
+      updatedTask =
+        (await patchTaskLocked(existing.id, (current) => ({
+          ...current,
           status: transResult.resolvedStatus,
           statusCategory: input.targetCategory,
           ...(safePrUrl ? { detectedPrUrl: safePrUrl } : {}),
@@ -3176,13 +3524,7 @@ export default function activate(orca: OrcaWorkerApi): void {
             ? { agentState: 'done' as const }
             : {}),
           updatedAt: Date.now()
-        }
-      : existing
-
-    if (transResult.providerSynced) {
-      const nextTasks = [...tasks]
-      nextTasks[index] = updatedTask
-      await saveEffectiveTasks(nextTasks, isDemo)
+        }))) ?? existing
 
       try {
         await orca.host.call('notifications.show', {
@@ -3429,63 +3771,72 @@ export default function activate(orca: OrcaWorkerApi): void {
     }
     lastWorkerError = notionSyncError ? redactSecrets(sanitizeUntrustedText(notionSyncError, 200)) : null
 
-    // Merge imported tasks with stored tasks (preserving local worktree/agent metadata) without mixing DEMO tasks (Fixes Bug #8)
+    // Merge imported tasks with latest stored tasks inside the lock so concurrent approvePlan/dispatch edits are never clobbered (F1)
     if (importedItems.length > 0) {
-      const preservedFields: Array<keyof TaskItem> = [
-        'linkedBranch',
-        'linkedOrcaWorkspaceId',
-        'linkedTerminalId',
-        'dispatchedAgent',
-        'agentState',
-        'agentStateStartedAt',
-        'detectedPrUrl',
-        'detectedCommitSummary',
-        'acVerificationStatus',
-        'acVerificationSummary',
-        'acReviewerTerminalId',
-        'repoId',
-        'planApproved',
-        'planLockActive',
-        'comments',
-        'unreadCommentsCount',
-        'fleetDismissed'
-      ]
-      const mergedMap = new Map(storedTasks.map((t) => [t.id, t]))
-      for (const item of importedItems) {
-        const prev = mergedMap.get(item.id)
-        if (prev) {
-          const merged: Record<string, unknown> = { ...prev, ...item }
-          for (const field of preservedFields) {
-            const val = prev[field] ?? item[field]
-            if (val !== undefined) {
-              merged[field] = val
-            } else {
-              delete merged[field]
+      await withTasksLock(async () => {
+        const latestStored = await readStoredTasks()
+        const preservedFields: Array<keyof TaskItem> = [
+          'linkedBranch',
+          'linkedOrcaWorkspaceId',
+          'linkedTerminalId',
+          'dispatchedAgent',
+          'agentState',
+          'agentStateStartedAt',
+          'detectedPrUrl',
+          'detectedCommitSummary',
+          'acVerificationStatus',
+          'acVerificationSummary',
+          'acReviewerTerminalId',
+          'repoId',
+          'planApproved',
+          'planLockActive',
+          'comments',
+          'unreadCommentsCount',
+          'fleetDismissed'
+        ]
+        const mergedMap = new Map(latestStored.map((t) => [t.id, t]))
+        for (const item of importedItems) {
+          const prev = mergedMap.get(item.id)
+          if (prev) {
+            const merged: Record<string, unknown> = { ...prev, ...item }
+            for (const field of preservedFields) {
+              const val = prev[field] ?? item[field]
+              if (val !== undefined) {
+                merged[field] = val
+              } else {
+                delete merged[field]
+              }
             }
+            mergedMap.set(item.id, merged as unknown as TaskItem)
+          } else {
+            mergedMap.set(item.id, item)
           }
-          mergedMap.set(item.id, merged as unknown as TaskItem)
-        } else {
-          mergedMap.set(item.id, item)
         }
-      }
-      await saveEffectiveTasks(Array.from(mergedMap.values()), false)
+        await saveEffectiveTasks(Array.from(mergedMap.values()), false)
+      })
     }
 
-    // Fetch latest comments for up to 5 in-flight non-manual tasks to surface review feedback
+    // Fetch latest comments for up to 15 active non-dismissed in-flight tasks (sorted by activity)
     const currentEffective = await readEffectiveTasks()
     if (!currentEffective.isDemo) {
       const inFlightCandidates = currentEffective.tasks
         .filter(
           (t) =>
             t.provider !== 'manual' &&
+            !t.fleetDismissed &&
             (Boolean(t.linkedBranch) ||
               t.statusCategory === 'in_progress' ||
               t.statusCategory === 'in_review')
         )
-        .slice(0, 5)
+        .sort((a, b) => {
+          const scoreA = (a.agentState === 'working' ? 2 : 0) + (a.linkedBranch ? 1 : 0)
+          const scoreB = (b.agentState === 'working' ? 2 : 0) + (b.linkedBranch ? 1 : 0)
+          if (scoreA !== scoreB) return scoreB - scoreA
+          return (b.updatedAt ?? 0) - (a.updatedAt ?? 0)
+        })
+        .slice(0, 15)
       if (inFlightCandidates.length > 0) {
-        let commentsUpdated = false
-        const tasksAfterComments = [...currentEffective.tasks]
+        const commentPatches = new Map<string, TaskCommentItem[]>()
         for (const candidate of inFlightCandidates) {
           try {
             const latestComments = await fetchTaskComments(
@@ -3495,30 +3846,37 @@ export default function activate(orca: OrcaWorkerApi): void {
               signal
             )
             if (latestComments.length > 0) {
-              const prevComments = candidate.comments ?? []
-              const prevIds = new Set(prevComments.map((c) => c.id))
-              const newCount = latestComments.filter((c) => !prevIds.has(c.id)).length
-              if (newCount > 0 || latestComments.length !== prevComments.length) {
-                const idx = tasksAfterComments.findIndex((t) => t.id === candidate.id)
-                if (idx !== -1) {
-                  tasksAfterComments[idx] = {
-                    ...tasksAfterComments[idx],
-                    comments: latestComments,
-                    unreadCommentsCount:
-                      prevComments.length === 0 && (candidate.unreadCommentsCount ?? 0) === 0
-                        ? latestComments.length
-                        : (candidate.unreadCommentsCount ?? 0) + newCount
-                  }
-                  commentsUpdated = true
-                }
-              }
+              commentPatches.set(candidate.id, latestComments)
             }
           } catch {
             // Best-effort comment sync
           }
         }
-        if (commentsUpdated) {
-          await saveEffectiveTasks(tasksAfterComments, false)
+        if (commentPatches.size > 0) {
+          await withTasksLock(async () => {
+            const latest = await readEffectiveTasks()
+            let updated = false
+            const nextTasks = latest.tasks.map((t) => {
+              const latestComments = commentPatches.get(t.id)
+              if (!latestComments) return t
+              const prevComments = t.comments ?? []
+              const prevIds = new Set(prevComments.map((c) => c.id))
+              const newCount = latestComments.filter((c) => !prevIds.has(c.id)).length
+              if (newCount === 0 && latestComments.length === prevComments.length) return t
+              updated = true
+              return {
+                ...t,
+                comments: latestComments,
+                unreadCommentsCount:
+                  prevComments.length === 0 && (t.unreadCommentsCount ?? 0) === 0
+                    ? latestComments.length
+                    : (t.unreadCommentsCount ?? 0) + newCount
+              }
+            })
+            if (updated) {
+              await saveEffectiveTasks(nextTasks, latest.isDemo)
+            }
+          })
         }
       }
     }
@@ -3589,63 +3947,75 @@ export default function activate(orca: OrcaWorkerApi): void {
   orca.panels.handle(
     'tasks.dispatch',
     async (input: DispatchTaskInput, { signal }): Promise<DispatchTaskOutput> => {
-      const { tasks, isDemo } = await readEffectiveTasks()
-      const index = tasks.findIndex((t) => t.id === input.taskId)
-      if (index === -1) {
-        const err = new Error(`Task not found: ${input.taskId}`) as Error & { code: string }
-        err.code = 'invalid_params'
+      if (activeDispatches.has(input.taskId)) {
+        const err = new Error(`Dispatch already in progress for ${input.taskId}.`) as Error & {
+          code: string
+        }
+        err.code = 'action_failed'
         throw err
       }
-
-      const existing = tasks[index]
-      const result = await dispatchSingleTask(existing, {
-        agent: input.agent,
-        repoId: input.repoId,
-        customBranch: input.customBranch,
-        createWorktree: input.createWorktree,
-        requirePlanApproval: input.requirePlanApproval,
-        enforcePlanLock: input.enforcePlanLock,
-        signal
-      })
-
-      const nextTasks = [...tasks]
-      nextTasks[index] = result.updatedTask
-      await saveEffectiveTasks(nextTasks, isDemo)
-      await orca.storage.set(STORAGE_ACTIVE_TASK_KEY, result.updatedTask.id)
-
+      activeDispatches.add(input.taskId)
       try {
-        await orca.host.call('notifications.show', {
-          title: result.launchWarning
-            ? `Worktree ready for ${result.updatedTask.key} (${result.agent} did not launch)`
-            : `Dispatched ${result.updatedTask.key} to ${result.agent}`,
-          body: result.launchWarning
-            ? result.launchWarning
-            : `Branch ${result.branch}${result.statusMoved ? ' · Moved to In Progress' : ''}`
+        const { tasks } = await readEffectiveTasks()
+        const existing = tasks.find((t) => t.id === input.taskId)
+        if (!existing) {
+          const err = new Error(`Task not found: ${input.taskId}`) as Error & { code: string }
+          err.code = 'invalid_params'
+          throw err
+        }
+
+        const result = await dispatchSingleTask(existing, {
+          agent: input.agent,
+          repoId: input.repoId,
+          customBranch: input.customBranch,
+          createWorktree: input.createWorktree,
+          requirePlanApproval: input.requirePlanApproval,
+          enforcePlanLock: input.enforcePlanLock,
+          signal
         })
-      } catch {
-        // Ignore notification errors
-      }
 
-      const state = await broadcastState()
-      const summary = result.launchWarning
-        ? result.launchWarning
-        : result.launchUnconfirmed
-          ? `Started [${result.updatedTask.key}] on branch ${result.branch} with ${result.agent}${
-              result.statusMoved ? ' and moved ticket to In Progress' : ''
-            } (Orca launch confirmation timed out; check workspace tab).`
-          : `Started [${result.updatedTask.key}] on branch ${result.branch} with ${result.agent}${
-              result.statusMoved ? ' and moved ticket to In Progress' : ''
-            }.`
+        await patchTaskLocked(existing.id, (current) => ({
+          ...current,
+          ...result.updatedTask
+        }))
+        await orca.storage.set(STORAGE_ACTIVE_TASK_KEY, result.updatedTask.id)
 
-      return {
-        state,
-        branch: result.branch,
-        agent: result.agent,
-        prompt: result.prompt,
-        statusMoved: result.statusMoved,
-        workspaceId: result.workspaceId,
-        ...(result.launchWarning ? { launchWarning: result.launchWarning } : {}),
-        summary
+        try {
+          await orca.host.call('notifications.show', {
+            title: result.launchWarning
+              ? `Worktree ready for ${result.updatedTask.key} (${result.agent} did not launch)`
+              : `Dispatched ${result.updatedTask.key} to ${result.agent}`,
+            body: result.launchWarning
+              ? result.launchWarning
+              : `Branch ${result.branch}${result.statusMoved ? ' · Moved to In Progress' : ''}`
+          })
+        } catch {
+          // Ignore notification errors
+        }
+
+        const state = await broadcastState()
+        const summary = result.launchWarning
+          ? result.launchWarning
+          : result.launchUnconfirmed
+            ? `Started [${result.updatedTask.key}] on branch ${result.branch} with ${result.agent}${
+                result.statusMoved ? ' and moved ticket to In Progress' : ''
+              } (Orca launch confirmation timed out; check workspace tab).`
+            : `Started [${result.updatedTask.key}] on branch ${result.branch} with ${result.agent}${
+                result.statusMoved ? ' and moved ticket to In Progress' : ''
+              }.`
+
+        return {
+          state,
+          branch: result.branch,
+          agent: result.agent,
+          prompt: result.prompt,
+          statusMoved: result.statusMoved,
+          workspaceId: result.workspaceId,
+          ...(result.launchWarning ? { launchWarning: result.launchWarning } : {}),
+          summary
+        }
+      } finally {
+        activeDispatches.delete(input.taskId)
       }
     }
   )
@@ -3653,27 +4023,46 @@ export default function activate(orca: OrcaWorkerApi): void {
   orca.panels.handle(
     'tasks.assignRepo',
     async (input: AssignTaskRepoInput): Promise<{ state: TaskBridgeState; summary: string }> => {
-      const { tasks, isDemo } = await readEffectiveTasks()
-      const index = tasks.findIndex((t) => t.id === input.taskId)
-      if (index === -1) {
+      const nextRepoId =
+        typeof input.repoId === 'string' && input.repoId.trim() ? input.repoId.trim() : undefined
+
+      let changedRepo = false
+      const updated = await patchTaskLocked(input.taskId, (current) => {
+        if (
+          nextRepoId !== current.repoId &&
+          (current.agentState === 'working' || current.agentState === 'waiting')
+        ) {
+          // Check whether a live agent is actually still running on that linked workspace/terminal
+          if (current.linkedOrcaWorkspaceId) {
+            changedRepo = true
+          }
+        }
+        const isSwitchingRepo = Boolean(nextRepoId && current.repoId && nextRepoId !== current.repoId)
+        const next: TaskItem = {
+          ...current,
+          updatedAt: Date.now()
+        }
+        if (nextRepoId) {
+          next.repoId = nextRepoId
+        } else {
+          delete next.repoId
+        }
+        // Clear stale worktree/terminal/branch links when reassigning to another repo (F12)
+        if (isSwitchingRepo || (!nextRepoId && current.repoId)) {
+          delete next.linkedOrcaWorkspaceId
+          delete next.linkedTerminalId
+          delete next.linkedBranch
+          delete next.agentState
+          delete next.agentStateStartedAt
+        }
+        return next
+      })
+      if (!updated) {
         const err = new Error(`Task not found: ${input.taskId}`) as Error & { code: string }
         err.code = 'invalid_params'
         throw err
       }
-      const nextRepoId =
-        typeof input.repoId === 'string' && input.repoId.trim() ? input.repoId.trim() : undefined
-      const updated: TaskItem = {
-        ...tasks[index],
-        updatedAt: Date.now()
-      }
-      if (nextRepoId) {
-        updated.repoId = nextRepoId
-      } else {
-        delete updated.repoId
-      }
-      const nextTasks = [...tasks]
-      nextTasks[index] = updated
-      await saveEffectiveTasks(nextTasks, isDemo)
+      void changedRepo
       const state = await broadcastState()
       const repoLabel =
         nextRepoId && state.availableRepos.find((r) => r.repoId === nextRepoId)?.name
@@ -3720,11 +4109,11 @@ export default function activate(orca: OrcaWorkerApi): void {
       const agent = validateAgentName(input.agent, cfg.defaultAgent)
       const dispatchedKeys: string[] = []
       const branches: string[] = []
-      const nextTasks = [...tasks]
 
       for (const child of pendingChildren) {
         const childId = `${parentTask.provider}:${child.key}`
-        let childTask = nextTasks.find((t) => t.id === childId)
+        const latestBeforeChild = await readEffectiveTasks()
+        let childTask = latestBeforeChild.tasks.find((t) => t.id === childId)
         if (!childTask) {
           childTask = {
             id: childId,
@@ -3750,7 +4139,12 @@ export default function activate(orca: OrcaWorkerApi): void {
             children: [],
             updatedAt: Date.now()
           }
-          nextTasks.push(childTask)
+          await withTasksLock(async () => {
+            const cur = await readEffectiveTasks()
+            if (!cur.tasks.some((t) => t.id === childId)) {
+              await saveEffectiveTasks([...cur.tasks, childTask!], cur.isDemo)
+            }
+          })
         }
 
         const explicitChildrenRepoId =
@@ -3764,24 +4158,42 @@ export default function activate(orca: OrcaWorkerApi): void {
           signal
         })
 
-        const cIdx = nextTasks.findIndex((t) => t.id === childId)
-        if (cIdx !== -1) {
-          nextTasks[cIdx] = dispatched.updatedTask
-        }
-
-        child.status = 'In Progress'
-        child.statusCategory = 'in_progress'
-        child.linkedBranch = dispatched.branch
-        child.dispatchedAgent = agent
-        if (dispatched.workspaceId) {
-          child.linkedOrcaWorkspaceId = dispatched.workspaceId
-        }
+        // Persist each dispatched child immediately so partial failures never lose earlier children (F2)
+        await withTasksLock(async () => {
+          const cur = await readEffectiveTasks()
+          const updatedList = [...cur.tasks]
+          const cIdx = updatedList.findIndex((t) => t.id === childId)
+          if (cIdx !== -1) {
+            updatedList[cIdx] = dispatched.updatedTask
+          } else {
+            updatedList.push(dispatched.updatedTask)
+          }
+          const pIdx = updatedList.findIndex((t) => t.id === parentTask.id)
+          if (pIdx !== -1 && updatedList[pIdx].children) {
+            updatedList[pIdx] = {
+              ...updatedList[pIdx],
+              children: updatedList[pIdx].children!.map((c) =>
+                c.key === child.key
+                  ? {
+                      ...c,
+                      status: 'In Progress',
+                      statusCategory: 'in_progress' as const,
+                      linkedBranch: dispatched.branch,
+                      dispatchedAgent: agent,
+                      ...(dispatched.workspaceId ? { linkedOrcaWorkspaceId: dispatched.workspaceId } : {})
+                    }
+                  : c
+              ),
+              updatedAt: Date.now()
+            }
+          }
+          await saveEffectiveTasks(updatedList, cur.isDemo)
+        })
 
         dispatchedKeys.push(child.key)
         branches.push(dispatched.branch)
       }
 
-      await saveEffectiveTasks(nextTasks, isDemo)
       const state = await broadcastState()
       return {
         state,
@@ -3861,6 +4273,24 @@ export default function activate(orca: OrcaWorkerApi): void {
         throw err
       }
 
+      // Ensure `.orca/task-bridge/.gitignore` exists locally so the reviewer's verdict JSON never pollutes git status
+      try {
+        const wsRes = await orca.host.call('workspace.list')
+        const targetWs = Array.isArray(wsRes?.workspaces)
+          ? wsRes.workspaces.find((w) => w.id === targetWorkspaceId)
+          : undefined
+        if (targetWs?.path && targetWs.path !== '.' && existsSync(targetWs.path)) {
+          const tbDir = path.join(targetWs.path, '.orca', 'task-bridge')
+          mkdirSync(tbDir, { recursive: true })
+          const gitignorePath = path.join(tbDir, '.gitignore')
+          if (!existsSync(gitignorePath)) {
+            writeFileSync(gitignorePath, '*\n', 'utf8')
+          }
+        }
+      } catch {
+        // Ignore best-effort .gitignore setup
+      }
+
       const launchOutcome = await launchAgentWithFallback({
         workspaceId: targetWorkspaceId,
         agent: reviewerAgent,
@@ -3885,17 +4315,17 @@ export default function activate(orca: OrcaWorkerApi): void {
 
       const status: AcVerificationStatus = 'running'
       const acSummary = `Verifying ${task.acceptanceCriteria.length || 1} acceptance criteria on ${branch} via ${reviewerAgent}...`
-      const updatedTask: TaskItem = {
-        ...task,
-        acVerificationStatus: status,
-        acVerificationSummary: acSummary,
-        ...(reviewerTerminalId ? { acReviewerTerminalId: reviewerTerminalId } : {}),
-        updatedAt: Date.now()
+      const updatedTask =
+        (await patchTaskLocked(task.id, (current) => ({
+          ...current,
+          acVerificationStatus: status,
+          acVerificationSummary: acSummary,
+          ...(reviewerTerminalId ? { acReviewerTerminalId: reviewerTerminalId } : {}),
+          updatedAt: Date.now()
+        }))) ?? task
+      if (reviewerTerminalId) {
+        acReviewerByTerminalId.set(reviewerTerminalId, updatedTask)
       }
-
-      const nextTasks = [...tasks]
-      nextTasks[index] = updatedTask
-      await saveEffectiveTasks(nextTasks, isDemo)
       const state = await broadcastState()
 
       return {
@@ -3965,24 +4395,17 @@ export default function activate(orca: OrcaWorkerApi): void {
   orca.panels.handle(
     'tasks.approvePlan',
     async (input: ApprovePlanInput): Promise<ApprovePlanOutput> => {
-      const { tasks, isDemo } = await readEffectiveTasks()
-      const index = tasks.findIndex((t) => t.id === input.taskId)
-      if (index === -1) {
+      const updatedTask = await patchTaskLocked(input.taskId, (current) => ({
+        ...current,
+        planApproved: true,
+        planLockActive: false,
+        updatedAt: Date.now()
+      }))
+      if (!updatedTask) {
         const err = new Error(`Task not found: ${input.taskId}`) as Error & { code: string }
         err.code = 'invalid_params'
         throw err
       }
-
-      const existing = tasks[index]
-      const updatedTask: TaskItem = {
-        ...existing,
-        planApproved: true,
-        planLockActive: false,
-        updatedAt: Date.now()
-      }
-      const nextTasks = [...tasks]
-      nextTasks[index] = updatedTask
-      await saveEffectiveTasks(nextTasks, isDemo)
 
       if (updatedTask.linkedTerminalId) taskByTerminalId.set(updatedTask.linkedTerminalId, updatedTask)
       if (updatedTask.linkedOrcaWorkspaceId) {
@@ -4123,6 +4546,31 @@ export default function activate(orca: OrcaWorkerApi): void {
         .join('\n')
 
       const agent = validateAgentName(task.dispatchedAgent, cfg.defaultAgent)
+
+      // Warn / require explicit confirmation before spawning a second session when a live agent is running (F16)
+      if (!input.confirmNewSession) {
+        try {
+          const agentsRes = await orca.host.call('agents.list')
+          const liveAgents = Array.isArray(agentsRes?.agents) ? agentsRes.agents : []
+          const liveMatch = liveAgents.find(
+            (ag) =>
+              (ag.state === 'working' || ag.state === 'waiting') &&
+              Boolean(ag.terminalId && task.linkedTerminalId && ag.terminalId === task.linkedTerminalId)
+          )
+          if (liveMatch) {
+            const err = new Error(
+              `An agent is still ${liveMatch.state} on [${task.key}]. Pass confirmNewSession: true to launch an additional feedback session.`
+            ) as Error & { code: string }
+            err.code = 'action_failed'
+            throw err
+          }
+        } catch (err) {
+          if (err instanceof Error && (err as Error & { code?: string }).code === 'action_failed') {
+            throw err
+          }
+        }
+      }
+
       let terminalId = task.linkedTerminalId
       try {
         const launchRes = await orca.host.call('agent.launch', {
@@ -4141,17 +4589,15 @@ export default function activate(orca: OrcaWorkerApi): void {
         throw err
       }
 
-      const updatedTask: TaskItem = {
-        ...task,
-        unreadCommentsCount: 0,
-        agentState: 'working',
-        agentStateStartedAt: Date.now(),
-        ...(terminalId ? { linkedTerminalId: terminalId } : {}),
-        updatedAt: Date.now()
-      }
-      const nextTasks = [...tasks]
-      nextTasks[index] = updatedTask
-      await saveEffectiveTasks(nextTasks, isDemo)
+      const updatedTask =
+        (await patchTaskLocked(task.id, (current) => ({
+          ...current,
+          unreadCommentsCount: 0,
+          agentState: 'working',
+          agentStateStartedAt: Date.now(),
+          ...(terminalId ? { linkedTerminalId: terminalId } : {}),
+          updatedAt: Date.now()
+        }))) ?? task
       if (terminalId) taskByTerminalId.set(terminalId, updatedTask)
       taskByWorkspaceId.set(task.linkedOrcaWorkspaceId, updatedTask)
 
@@ -4260,55 +4706,78 @@ export default function activate(orca: OrcaWorkerApi): void {
   orca.panels.handle(
     'tasks.dismissFleet',
     async (input: DismissFleetInput): Promise<DismissFleetOutput> => {
-      const { tasks, isDemo } = await readEffectiveTasks()
-      let removedCount = 0
-      let removedKey: string | null = null
-      let nextTasks = [...tasks]
-
-      if (input.taskId) {
-        const idx = nextTasks.findIndex((t) => t.id === input.taskId)
-        if (idx === -1) {
-          const err = new Error(`Task not found: ${input.taskId}`) as Error & { code: string }
-          err.code = 'invalid_params'
-          throw err
-        }
-        removedKey = nextTasks[idx].key
-        nextTasks[idx] = clearTaskFleetLinks(nextTasks[idx])
-        removedCount = 1
-      } else if (input.clearFinished) {
-        let workspaces: HostWorkspaceEntry[] = []
+      let workspaces: HostWorkspaceEntry[] = []
+      let workspaceListOk = false
+      if (input.clearFinished) {
         try {
           const wsRes = await orca.host.call('workspace.list')
-          if (Array.isArray(wsRes?.workspaces)) workspaces = wsRes.workspaces
+          if (Array.isArray(wsRes?.workspaces)) {
+            workspaces = wsRes.workspaces
+            workspaceListOk = true
+          }
         } catch {
-          // Ignore
+          workspaceListOk = false
+        }
+        if (!workspaceListOk) {
+          const state = await broadcastState()
+          return {
+            state,
+            removedCount: 0,
+            summary: 'Could not verify workspaces (workspace.list failed); skipped clearing Fleet.'
+          }
+        }
+      }
+
+      let removedCount = 0
+      let removedKey: string | null = null
+
+      await withTasksLock(async () => {
+        const { tasks, isDemo } = await readEffectiveTasks()
+        let nextTasks = [...tasks]
+
+        if (input.taskId) {
+          const idx = nextTasks.findIndex((t) => t.id === input.taskId)
+          if (idx === -1) {
+            const err = new Error(`Task not found: ${input.taskId}`) as Error & { code: string }
+            err.code = 'invalid_params'
+            throw err
+          }
+          removedKey = nextTasks[idx].key
+          nextTasks[idx] = clearTaskFleetLinks(nextTasks[idx])
+          removedCount = 1
+        } else if (input.clearFinished) {
+          nextTasks = nextTasks.map((t) => {
+            const inFleet =
+              !t.fleetDismissed &&
+              (Boolean(t.linkedBranch) ||
+                Boolean(t.linkedOrcaWorkspaceId) ||
+                t.statusCategory === 'in_progress')
+            if (!inFleet) return t
+
+            // Never clear or unlock an agent that is still working or waiting (F3)
+            if (t.agentState === 'working' || t.agentState === 'waiting') {
+              return t
+            }
+
+            const hasLiveWs = workspaces.some(
+              (w) =>
+                (t.linkedOrcaWorkspaceId && w.id === t.linkedOrcaWorkspaceId) ||
+                (t.linkedBranch && w.branch === t.linkedBranch)
+            )
+            const isFinishedOrOrphaned =
+              t.statusCategory === 'done' || t.statusCategory === 'in_review' || !hasLiveWs
+            if (!isFinishedOrOrphaned) return t
+
+            removedCount++
+            return clearTaskFleetLinks(t)
+          })
         }
 
-        nextTasks = nextTasks.map((t) => {
-          const inFleet =
-            !t.fleetDismissed &&
-            (Boolean(t.linkedBranch) ||
-              Boolean(t.linkedOrcaWorkspaceId) ||
-              t.statusCategory === 'in_progress')
-          if (!inFleet) return t
+        if (removedCount > 0) {
+          await saveEffectiveTasks(nextTasks, isDemo)
+        }
+      })
 
-          const hasLiveWs = workspaces.some(
-            (w) =>
-              (t.linkedOrcaWorkspaceId && w.id === t.linkedOrcaWorkspaceId) ||
-              (t.linkedBranch && w.branch === t.linkedBranch)
-          )
-          const isFinishedOrOrphaned =
-            t.statusCategory === 'done' || t.statusCategory === 'in_review' || !hasLiveWs
-          if (!isFinishedOrOrphaned) return t
-
-          removedCount++
-          return clearTaskFleetLinks(t)
-        })
-      }
-
-      if (removedCount > 0) {
-        await saveEffectiveTasks(nextTasks, isDemo)
-      }
       const state = await broadcastState()
       return {
         state,
@@ -4350,7 +4819,7 @@ export default function activate(orca: OrcaWorkerApi): void {
         taskId: focusedLinkedTask.id,
         targetCategory: 'in_review',
         prUrl: detected.prUrl ?? undefined,
-        comment: detected.commitSummary
+        comment: detected.hasNewActivity ? detected.commitSummary : undefined
       },
       signal
     )
@@ -4362,35 +4831,48 @@ export default function activate(orca: OrcaWorkerApi): void {
     await broadcastState()
   })
 
-  // Fixes Bug #5 & persistence: Match the exact ticket by `terminalId` or `workspaceId`, handle AC reviewer completion, and persist to storage
+  // Fixes Bug #5 & F4: Match AC reviewer strictly by `terminalId`, parse `.orca/task-bridge/ac-<KEY>.json`, and patch tasks under mutex
   orca.events.on('agent.status.changed', async (payload) => {
     const rawPayload = payload as Record<string, unknown>
     const termId = typeof rawPayload.terminalId === 'string' ? rawPayload.terminalId : null
     const wsId = typeof rawPayload.workspaceId === 'string' ? rawPayload.workspaceId : null
 
-    const { tasks, isDemo } = await readEffectiveTasks()
+    const { tasks } = await readEffectiveTasks()
 
-    // 1. Check if this event belongs to a secondary AC reviewer terminal
+    // 1. Match secondary AC reviewer strictly by `acReviewerTerminalId === termId` (never fall back to workspaceId)
     const reviewerIndex = termId
       ? tasks.findIndex((t) => t.acReviewerTerminalId === termId)
       : -1
     if (reviewerIndex !== -1) {
       const revTask = tasks[reviewerIndex]
       if (payload.state === 'done') {
-        const updatedRevTask: TaskItem = {
-          ...revTask,
-          acVerificationStatus: 'verified',
-          acVerificationSummary: `Acceptance Criteria verification completed on ${revTask.linkedBranch ?? 'branch'}.`,
-          updatedAt: Date.now()
+        let wsPath: string | null = null
+        try {
+          const wsRes = await orca.host.call('workspace.list')
+          const workspaces = Array.isArray(wsRes?.workspaces) ? wsRes.workspaces : []
+          const matchedWs = workspaces.find(
+            (w) =>
+              (revTask.linkedOrcaWorkspaceId && w.id === revTask.linkedOrcaWorkspaceId) ||
+              (revTask.linkedBranch && w.branch === revTask.linkedBranch)
+          )
+          wsPath = matchedWs?.path ?? null
+        } catch {
+          wsPath = null
         }
-        const nextTasks = [...tasks]
-        nextTasks[reviewerIndex] = updatedRevTask
-        await saveEffectiveTasks(nextTasks, isDemo)
+
+        const verdictResult = readAcVerdictFromWorkspace(wsPath, revTask.key)
+        const updatedRevTask =
+          (await patchTaskLocked(revTask.id, (current) => ({
+            ...current,
+            acVerificationStatus: verdictResult.status,
+            acVerificationSummary: verdictResult.summary,
+            updatedAt: Date.now()
+          }))) ?? revTask
 
         try {
           await orca.host.call('notifications.show', {
-            title: `AC verification finished for ${updatedRevTask.key}`,
-            body: `Reviewer finished checking ${updatedRevTask.title}.`
+            title: `AC verification ${verdictResult.status} for ${updatedRevTask.key}`,
+            body: verdictResult.summary
           })
         } catch {
           // Ignore
@@ -4432,18 +4914,14 @@ export default function activate(orca: OrcaWorkerApi): void {
       }
     }
 
-    const updatedTask: TaskItem = {
-      ...existingTask,
+    await patchTaskLocked(existingTask.id, (current) => ({
+      ...current,
       agentState: payload.state as LiveAgentState,
       agentStateStartedAt: Date.now(),
       ...(detectedPrUrl ? { detectedPrUrl } : {}),
       ...(detectedCommitSummary ? { detectedCommitSummary } : {}),
       updatedAt: Date.now()
-    }
-
-    const nextTasks = [...tasks]
-    nextTasks[targetIndex] = updatedTask
-    await saveEffectiveTasks(nextTasks, isDemo)
+    }))
     await broadcastState()
   })
 
@@ -4497,9 +4975,23 @@ export default function activate(orca: OrcaWorkerApi): void {
     })
   })
 
-  // Optional Plan-First Execution Gate: allowlists read-only tools/commands per agent and fails closed until approved
+  // Optional Plan-First Execution Gate + Read-Only AC Reviewer lock: allowlists read-only tools/commands per agent and fails closed
   orca.hooks.on('agent.tool.before', async (event) => {
     await initLookupPromise
+
+    // AC Reviewer terminals remain strictly read-only even after the main implementation plan is approved (F4)
+    const acReviewerTask = event.terminalId ? acReviewerByTerminalId.get(event.terminalId) : undefined
+    if (acReviewerTask) {
+      if (
+        isPlanLockToolAllowed(event.agent, event.tool, event.input) ||
+        isAcReviewerVerdictWrite(event.tool, event.input, acReviewerTask.key)
+      ) {
+        return
+      }
+      return {
+        deny: `Task Bridge AC Reviewer Guard: [${acReviewerTask.key}] reviewer terminal is read-only and may only inspect the repo or write .orca/task-bridge/ac-${acReviewerTask.key}.json.`
+      }
+    }
 
     const matchedTask =
       (event.terminalId ? taskByTerminalId.get(event.terminalId) : undefined) ??

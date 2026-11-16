@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -26,7 +27,8 @@ import {
   scanRepoGuidelines,
   selectAcReviewerAgent,
   setCliLaunchForTests,
-  setCliRunnerForTests
+  setCliRunnerForTests,
+  setRepoToolRunnerForTests
 } from './worker'
 
 test('builds standardized branch names, structured prompts, and classifies statuses accurately (Bug #2)', () => {
@@ -308,7 +310,7 @@ test('dispatches tickets, fans out subtasks, verifies AC, and isolates multi-age
   })
   const afterReviewState = await worker.request('tasks.getState')
   const reviewedTask = afterReviewState.tasks.find((t) => t.id === 'linear:LIN-142')
-  assert.equal(reviewedTask?.acVerificationStatus, 'verified')
+  assert.equal(reviewedTask?.acVerificationStatus, 'unknown')
 
   // Primary agent finishes -> persists agentState & detectedCommitSummary across getState()
   await worker.emit('agent.status.changed', {
@@ -2367,5 +2369,756 @@ test('S6: demo tickets never send --reference, --reference-site, or transition/c
   } finally {
     setCliRunnerForTests(null)
     await worker.deactivate()
+  }
+})
+
+test('F1: tasks.approvePlan is never overwritten by a concurrent slow tasks.sync', async () => {
+  const host = mockHost({
+    results: {
+      'workspace.readContext': { branch: 'feat/lin-901', displayName: 'feat/lin-901', terminals: [] },
+      'workspace.list': {
+        workspaces: [
+          {
+            id: 'repo1::/repo/lin-901',
+            kind: 'worktree',
+            name: 'feat/lin-901',
+            path: '/repo/lin-901',
+            branch: 'feat/lin-901',
+            hostId: null
+          }
+        ],
+        truncated: false
+      },
+      'agent.launch': { terminalId: 'term-f1' },
+      'workspace.rename': null,
+      'notifications.show': null
+    }
+  })
+
+  let releaseSlowSync!: () => void
+  const slowSyncGate = new Promise<void>((resolve) => {
+    releaseSlowSync = resolve
+  })
+
+  setCliRunnerForTests(async (args) => {
+    if (args[0] === 'linear' && args[1] === 'list-issues') {
+      await slowSyncGate
+      return {
+        ok: true,
+        result: [
+          {
+            id: 'f1-lin-901',
+            identifier: 'LIN-901',
+            title: 'Keep planApproved across slow sync',
+            status: 'In Progress',
+            state: { name: 'In Progress', type: 'started' }
+          }
+        ]
+      }
+    }
+    if (args[0] === 'linear' && args[1] === 'issue') {
+      return { ok: true, result: null }
+    }
+    return { ok: true, result: {} }
+  })
+
+  const worker = await mountWorker(main, { host })
+  try {
+    // Seed a real stored task first
+    const added = await worker.request('tasks.addManual', {
+      provider: 'linear',
+      key: 'LIN-901',
+      title: 'Keep planApproved across slow sync'
+    })
+    await worker.request('tasks.dispatch', {
+      taskId: added.created.id,
+      createWorktree: false,
+      repoId: 'repo1',
+      requirePlanApproval: true,
+      enforcePlanLock: true
+    })
+
+    // Start slow tasks.sync while plan is still unapproved, then approve plan BEFORE sync finishes
+    const syncPromise = worker.request('tasks.sync', { provider: 'linear', scope: 'assigned' })
+    await new Promise((r) => setTimeout(r, 20))
+    const approveRes = await worker.request('tasks.approvePlan', { taskId: added.created.id })
+    const approvedTask = approveRes.state.tasks.find((t) => t.key === 'LIN-901')
+    assert.equal(approvedTask?.planApproved, true)
+    assert.equal(approvedTask?.planLockActive, false)
+
+    releaseSlowSync()
+    const syncAfter = await syncPromise
+    const taskAfter = syncAfter.state.tasks.find((t) => t.key === 'LIN-901')
+    assert.equal(taskAfter?.planApproved, true, 'sync must not clobber concurrent approvePlan')
+    assert.equal(taskAfter?.planLockActive, false)
+  } finally {
+    setCliRunnerForTests(null)
+    await worker.deactivate()
+  }
+})
+
+test('F2: prevents duplicate agent launches on retry or live workspace and saves each child incrementally', async () => {
+  const workspaces = [
+    {
+      id: 'repo1::/repo/main',
+      kind: 'worktree' as const,
+      name: 'main',
+      path: '/repo/main',
+      branch: 'main',
+      hostId: null
+    }
+  ]
+
+  let liveAgents: Array<{ terminalId: string; title: string; agent: string; state: string; stateStartedAt: number }> = []
+  const host = mockHost({
+    results: {
+      'workspace.readContext': { branch: 'main', displayName: 'main', terminals: [] },
+      'workspace.list': () => ({ workspaces, truncated: false }),
+      'agents.list': () => ({ agents: liveAgents }),
+      'agent.launch': { terminalId: 'term-f2-child1' },
+      'workspace.rename': null,
+      'notifications.show': null
+    }
+  })
+
+  // Case A: worktree created, subsequent agent launch error or retry does NOT duplicate
+  setCliRunnerForTests(async (args) => {
+    if (args[0] === 'worktree' && args[1] === 'create') {
+      const b = args[args.indexOf('--branch') + 1]
+      workspaces.push({
+        id: `repo1::/repo/${b}`,
+        kind: 'worktree',
+        name: b,
+        path: `/repo/${b}`,
+        branch: b,
+        hostId: null
+      })
+      liveAgents = [{ terminalId: 'term-f2-child1', title: 'Claude', agent: 'claude', state: 'working', stateStartedAt: Date.now() }]
+      return { ok: true, result: { id: `repo1::/repo/${b}`, launch: { outcome: { kind: 'terminal', handle: 'term-f2-live' } } } }
+    }
+    return { ok: true, result: {} }
+  })
+
+  const worker = await mountWorker(main, { host })
+  try {
+    const added = await worker.request('tasks.addManual', {
+      provider: 'linear',
+      key: 'DUP-1',
+      title: 'Prevent duplicate launches'
+    })
+    await worker.request('tasks.dispatch', { taskId: added.created.id, createWorktree: true, repoId: 'repo1' })
+    const launchesBeforeRetry = host.callsOf('agent.launch').length
+
+    // Second dispatch while agents.list reports a live working agent in the workspace must NOT launch another agent
+    await assert.rejects(() =>
+      worker.request('tasks.dispatch', { taskId: added.created.id, createWorktree: true, repoId: 'repo1' })
+    )
+    assert.equal(host.callsOf('agent.launch').length, launchesBeforeRetry)
+
+    // Case B: dispatchChildren persists child 1 even when child 2 fails mid-loop
+    liveAgents = []
+    let createCount = 0
+    setCliRunnerForTests(async (args) => {
+      if (args[0] === 'worktree' && args[1] === 'create') {
+        createCount += 1
+        if (createCount === 2) {
+          return { ok: false, error: { message: 'Disk full on child 2' } }
+        }
+        const b = args[args.indexOf('--branch') + 1]
+        workspaces.push({
+          id: `repo1::/repo/${b}`,
+          kind: 'worktree',
+          name: b,
+          path: `/repo/${b}`,
+          branch: b,
+          hostId: null
+        })
+        return { ok: true, result: { id: `repo1::/repo/${b}` } }
+      }
+      return { ok: true, result: {} }
+    })
+
+    const parentRes = await worker.request('tasks.addManual', {
+      provider: 'linear',
+      key: 'EPIC-10',
+      title: 'Parent epic'
+    })
+    // Seed children onto EPIC-10 via sync-like or direct storage update using sync
+    setCliRunnerForTests(async (args) => {
+      if (args[0] === 'linear' && args[1] === 'list-issues') {
+        return {
+          ok: true,
+          result: [
+            {
+              id: 'epic-10',
+              identifier: 'EPIC-10',
+              title: 'Parent epic',
+              status: 'Todo',
+              state: { name: 'Todo', type: 'unstarted' },
+              children: {
+                nodes: [
+                  { identifier: 'SUB-1', title: 'Child one', state: { name: 'Todo', type: 'unstarted' } },
+                  { identifier: 'SUB-2', title: 'Child two', state: { name: 'Todo', type: 'unstarted' } }
+                ]
+              }
+            }
+          ]
+        }
+      }
+      if (args[0] === 'worktree' && args[1] === 'create') {
+        createCount += 1
+        if (createCount === 2) {
+          return { ok: false, error: { message: 'Disk full on child 2' } }
+        }
+        const b = args[args.indexOf('--branch') + 1]
+        workspaces.push({
+          id: `repo1::/repo/${b}`,
+          kind: 'worktree',
+          name: b,
+          path: `/repo/${b}`,
+          branch: b,
+          hostId: null
+        })
+        return { ok: true, result: { id: `repo1::/repo/${b}` } }
+      }
+      return { ok: true, result: {} }
+    })
+    await worker.request('tasks.sync', { provider: 'linear', scope: 'assigned' })
+    createCount = 0
+    await assert.rejects(() =>
+      worker.request('tasks.dispatchChildren', { parentTaskId: parentRes.created.id, repoId: 'repo1' })
+    )
+    const stateAfterPartial = await worker.request('tasks.getState')
+    const savedSub1 = stateAfterPartial.tasks.find((t) => t.key === 'SUB-1')
+    assert.ok(savedSub1?.linkedBranch, 'SUB-1 must remain persisted even though SUB-2 failed')
+  } finally {
+    setCliRunnerForTests(null)
+    await worker.deactivate()
+  }
+})
+
+test('F3: Clear Finished skips live working/waiting agents, preserves planLockActive, and aborts when workspace.list fails', async () => {
+  let failWorkspaceList = false
+  const host = mockHost({
+    results: {
+      'workspace.readContext': { branch: 'feat/live-1', displayName: 'feat/live-1', terminals: [] },
+      'workspace.list': () => {
+        if (failWorkspaceList) {
+          throw new Error('RPC timeout')
+        }
+        return {
+          workspaces: [
+            {
+              id: 'repo1::/repo/live-1',
+              kind: 'worktree',
+              name: 'feat/live-1',
+              path: '/repo/live-1',
+              branch: 'feat/live-1',
+              hostId: null
+            }
+          ],
+          truncated: false
+        }
+      },
+      'agent.launch': { terminalId: 'term-f3-live' },
+      'workspace.rename': null,
+      'notifications.show': null
+    }
+  })
+
+  const worker = await mountWorker(main, { host })
+  const added = await worker.request('tasks.addManual', {
+    provider: 'linear',
+    key: 'LIVE-1',
+    title: 'Live agent must survive Clear Finished'
+  })
+  await worker.request('tasks.dispatch', {
+    taskId: added.created.id,
+    createWorktree: false,
+    repoId: 'repo1',
+    requirePlanApproval: true,
+    enforcePlanLock: true
+  })
+
+  // 1. Even if workspace.list fails transiently, Clear Finished must clear NOTHING
+  failWorkspaceList = true
+  const failedClear = await worker.request('tasks.dismissFleet', { clearFinished: true })
+  assert.equal(failedClear.removedCount, 0)
+  const liveAfterFailed = failedClear.state.tasks.find((t) => t.key === 'LIVE-1')
+  assert.equal(liveAfterFailed?.linkedTerminalId, 'term-f3-live')
+  assert.equal(liveAfterFailed?.planLockActive, true)
+
+  // 2. Even if LIVE-1 moved to in_review/done or workspace temporarily vanished while agentState is working, do NOT sweep!
+  failWorkspaceList = false
+  const cleared = await worker.request('tasks.dismissFleet', { clearFinished: true })
+  assert.equal(cleared.removedCount, 0)
+  const liveAfterClear = cleared.state.tasks.find((t) => t.key === 'LIVE-1')
+  assert.equal(liveAfterClear?.planLockActive, true)
+  assert.equal(liveAfterClear?.linkedTerminalId, 'term-f3-live')
+
+  await worker.deactivate()
+})
+
+test('F4: AC verification reads .orca/task-bridge/ac-<KEY>.json, fails on CHANGES_REQUIRED, marks unknown if missing, and blocks reviewer edits even after plan approval', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tb-f4-'))
+  try {
+    const wsPath = path.join(root, 'wt')
+    mkdirSync(wsPath, { recursive: true })
+
+    let launchIdx = 0
+    const host = mockHost({
+      results: {
+        'workspace.readContext': { branch: 'feat/ac-1', displayName: 'feat/ac-1', terminals: [] },
+        'workspace.list': {
+          workspaces: [
+            {
+              id: 'repo1::' + wsPath,
+              kind: 'worktree',
+              name: 'feat/ac-1',
+              path: wsPath,
+              branch: 'feat/ac-1',
+              hostId: null
+            }
+          ],
+          truncated: false
+        },
+        'agent.launch': () => {
+          launchIdx += 1
+          return { terminalId: launchIdx === 1 ? 'term-impl-ac' : `term-rev-${launchIdx}` }
+        },
+        'workspace.rename': null,
+        'notifications.show': null
+      }
+    })
+
+    const worker = await mountWorker(main, { host })
+    const added = await worker.request('tasks.addManual', {
+      provider: 'linear',
+      key: 'AC-1',
+      title: 'Verify AC verdict file'
+    })
+    await worker.request('tasks.dispatch', {
+      taskId: added.created.id,
+      createWorktree: false,
+      repoId: 'repo1',
+      requirePlanApproval: true,
+      enforcePlanLock: true
+    })
+    // Approve main agent's plan so main terminal CAN write, while reviewer MUST STILL be locked!
+    await worker.request('tasks.approvePlan', { taskId: added.created.id })
+
+    // Run AC verification (creates term-rev-2)
+    await worker.request('tasks.verifyAcceptanceCriteria', {
+      taskId: added.created.id,
+      reviewerAgent: 'claude'
+    })
+
+    // Reviewer cannot edit source files even though planApproved is true!
+    const deniedRevEdit = await worker.hooks.fire('agent.tool.before', {
+      agent: 'claude',
+      workspaceId: 'repo1::' + wsPath,
+      terminalId: 'term-rev-2',
+      tool: 'Edit',
+      input: { file_path: 'src/index.ts' }
+    })
+    assert.equal(deniedRevEdit.kind, 'deny')
+
+    // Reviewer IS allowed to write its own verdict file `.orca/task-bridge/ac-AC-1.json`
+    const allowedVerdictWrite = await worker.hooks.fire('agent.tool.before', {
+      agent: 'claude',
+      workspaceId: 'repo1::' + wsPath,
+      terminalId: 'term-rev-2',
+      tool: 'Write',
+      input: { file_path: '.orca/task-bridge/ac-AC-1.json', content: '{}' }
+    })
+    assert.equal(allowedVerdictWrite.kind, 'continue')
+
+    // Done event WITHOUT terminalId must NOT resolve AC verification
+    await worker.emit('agent.status.changed', {
+      workspaceId: 'repo1::' + wsPath,
+      paneKey: 'pane-missing-term',
+      state: 'done',
+      receivedAt: Date.now()
+    })
+    const stillRunning = (await worker.request('tasks.getState')).tasks.find((t) => t.key === 'AC-1')
+    assert.equal(stillRunning?.acVerificationStatus, 'running')
+
+    // Write CHANGES_REQUIRED verdict JSON -> status becomes 'failed'
+    mkdirSync(path.join(wsPath, '.orca', 'task-bridge'), { recursive: true })
+    writeFileSync(
+      path.join(wsPath, '.orca', 'task-bridge', 'ac-AC-1.json'),
+      JSON.stringify({ verdict: 'CHANGES_REQUIRED', summary: 'Missing rate limit test.' }),
+      'utf8'
+    )
+    await worker.emit('agent.status.changed', {
+      workspaceId: 'repo1::' + wsPath,
+      paneKey: 'pane-rev-2',
+      terminalId: 'term-rev-2',
+      state: 'done',
+      receivedAt: Date.now()
+    })
+    const afterChangesReq = (await worker.request('tasks.getState')).tasks.find((t) => t.key === 'AC-1')
+    assert.equal(afterChangesReq?.acVerificationStatus, 'failed')
+
+    // Missing verdict file -> status becomes 'unknown' (never blindly 'verified')
+    rmSync(path.join(wsPath, '.orca', 'task-bridge', 'ac-AC-1.json'))
+    await worker.request('tasks.verifyAcceptanceCriteria', {
+      taskId: added.created.id,
+      reviewerAgent: 'claude'
+    })
+    await worker.emit('agent.status.changed', {
+      workspaceId: 'repo1::' + wsPath,
+      paneKey: 'pane-rev-3',
+      terminalId: 'term-rev-3',
+      state: 'done',
+      receivedAt: Date.now()
+    })
+    const afterMissing = (await worker.request('tasks.getState')).tasks.find((t) => t.key === 'AC-1')
+    assert.equal(afterMissing?.acVerificationStatus, 'unknown')
+
+    // Write READY_FOR_REVIEW verdict JSON -> status becomes 'verified'
+    await worker.request('tasks.verifyAcceptanceCriteria', {
+      taskId: added.created.id,
+      reviewerAgent: 'claude'
+    })
+    writeFileSync(
+      path.join(wsPath, '.orca', 'task-bridge', 'ac-AC-1.json'),
+      JSON.stringify({ verdict: 'READY_FOR_REVIEW', summary: 'All checks passed.' }),
+      'utf8'
+    )
+    await worker.emit('agent.status.changed', {
+      workspaceId: 'repo1::' + wsPath,
+      paneKey: 'pane-rev-4',
+      terminalId: 'term-rev-4',
+      state: 'done',
+      receivedAt: Date.now()
+    })
+    const afterReady = (await worker.request('tasks.getState')).tasks.find((t) => t.key === 'AC-1')
+    assert.equal(afterReady?.acVerificationStatus, 'verified')
+
+    await worker.deactivate()
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('F5, F6, F9, F10, F13, F14, F15, F17: fixes status mapping, AC extraction, issue kind, ADF, Jira underscore keys, branch hints, and hydration', async () => {
+  // F6: Notion "Not started", "Listo para QA", "Revisión de código", "Finalizada"
+  assert.equal(mapStatusToCategory('Not started'), 'todo')
+  assert.equal(mapStatusToCategory('Listo para QA'), 'todo')
+  assert.equal(mapStatusToCategory('Lista para desarrollo'), 'todo')
+  assert.equal(mapStatusToCategory('Revisión'), 'in_review')
+  assert.equal(mapStatusToCategory('Revisión de código'), 'in_review')
+  assert.equal(mapStatusToCategory('Finalizada'), 'done')
+  assert.equal(mapStatusToCategory('Finalizado'), 'done')
+
+  // F10: Story title "Build export page" / "Add docs viewer" stays feature, not chore
+  assert.equal(mapIssueKind('Story', 'Build export page'), 'feature')
+  assert.equal(mapIssueKind('Story', 'Add docs viewer'), 'feature')
+  assert.equal(mapIssueKind('Historia', 'Refactor legacy auth'), 'feature')
+  assert.equal(mapIssueKind('Task', 'Cleanup old build scripts'), 'chore')
+
+  // F13: Jira key with underscore
+  assert.equal(validateTicketKey('MY_PROJ-12'), 'MY_PROJ-12')
+
+  // F9: long description (>3000 chars) + non-markdown headings + multilingual headings
+  const longDesc = [
+    'Intro '.repeat(600),
+    '**Criterios de aceptación**',
+    '1. Token rotates cleanly',
+    '2. Lock releases on 401',
+    '',
+    'Out of scope:',
+    '- delete legacy tables'
+  ].join('\n')
+  const parsedLinearLong = parseLinearTasksResult([
+    {
+      identifier: 'LIN-888',
+      title: 'Long description AC',
+      description: longDesc,
+      state: { name: 'Todo', type: 'unstarted' }
+    }
+  ])
+  assert.deepEqual(parsedLinearLong[0]?.acceptanceCriteria, [
+    'Token rotates cleanly',
+    'Lock releases on 401'
+  ])
+
+  // F17: Linear { issue, children: undefined } preserves issue.children.nodes
+  const parsedLinearWithNodes = parseLinearTasksResult({
+    issue: {
+      identifier: 'LIN-889',
+      title: 'Preserve children nodes',
+      state: { name: 'Todo', type: 'unstarted' },
+      children: {
+        nodes: [{ identifier: 'LIN-890', title: 'Child node', state: { name: 'Todo', type: 'unstarted' } }]
+      }
+    }
+  })
+  assert.equal(parsedLinearWithNodes[0]?.children?.length, 1)
+  assert.equal(parsedLinearWithNodes[0]?.children?.[0]?.key, 'LIN-890')
+
+  // F14: Jira Cloud ADF object description does not produce [object Object]
+  const parsedJiraAdf = parseJiraTasksResult([
+    {
+      key: 'MY_PROJ-12',
+      summary: 'ADF description ticket',
+      status: { name: 'To Do', categoryKey: 'new' },
+      description: {
+        type: 'doc',
+        version: 1,
+        content: [
+          { type: 'paragraph', content: [{ type: 'text', text: 'Support ADF paragraphs.' }] },
+          {
+            type: 'bulletList',
+            content: [
+              {
+                type: 'listItem',
+                content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Render text cleanly' }] }]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ])
+  assert.equal(parsedJiraAdf.length, 1)
+  assert.equal(parsedJiraAdf[0]?.description.includes('[object Object]'), false)
+  assert.ok(parsedJiraAdf[0]?.description.includes('Support ADF paragraphs.'))
+  assert.ok(parsedJiraAdf[0]?.description.includes('Render text cleanly'))
+
+  // F15: CLAUDE.md with lowercase example `feature/lin-142-x` + `OPENAI_API_KEY` stays lowercase `{key}`
+  const root = mkdtempSync(path.join(tmpdir(), 'tb-f15-'))
+  try {
+    writeFileSync(
+      path.join(root, 'CLAUDE.md'),
+      'Use branch naming like `feature/lin-142-example`.\nNever commit `OPENAI_API_KEY`.\n',
+      'utf8'
+    )
+    const guidelines = scanRepoGuidelines('r1', 'Repo', root)
+    assert.equal(guidelines?.detectedBranchHint, 'feature/{key}-{slug}')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('F7, F8, F12, F16: excludes Won\'t Do / canceled Done transitions, checks Notion res.ok, clears stale repo links, and guards feedback on live sessions', async () => {
+  const workspaces = [
+    { id: 'repoA::/repo/a', kind: 'worktree' as const, name: 'main', path: '/repo/a', branch: 'main', hostId: null },
+    { id: 'repoB::/repo/b', kind: 'worktree' as const, name: 'main', path: '/repo/b', branch: 'main', hostId: null }
+  ]
+  const liveAgents: Array<{ terminalId: string; title: string; agent: string; state: string; stateStartedAt: number }> = []
+  const host = mockHost({
+    settings: {
+      notionDatabaseId: '22222222-2222-2222-2222-222222222222'
+    },
+    results: {
+      'workspace.readContext': { branch: 'main', displayName: 'main', terminals: [] },
+      'workspace.list': () => ({ workspaces, truncated: false }),
+      'agents.list': () => ({ agents: liveAgents }),
+      'agent.launch': { terminalId: 'term-f-new' },
+      'workspace.rename': null,
+      'notifications.show': null
+    }
+  })
+
+  // F7: Jira list has "Won't Do" before "Done", and "Cancel" before "Done" in Linear
+  setCliRunnerForTests(async (args) => {
+    if (args[0] === 'jira' && args[1] === 'connection') {
+      return { ok: true, result: { sites: [{ id: 's1', siteUrl: 'https://a.atlassian.net', email: 'a@b.com' }], selectedSiteId: 's1' } }
+    }
+    if (args[0] === 'jira' && args[1] === 'list') {
+      return { ok: true, result: [{ key: 'F7-1', summary: 'Skip wont do', status: { name: 'In Progress', categoryKey: 'indeterminate' } }] }
+    }
+    if (args[0] === 'jira' && args[1] === 'issue') {
+      return { ok: true, result: { key: 'F7-1', summary: 'Skip wont do', status: { name: 'In Progress', categoryKey: 'indeterminate' } } }
+    }
+    if (args[0] === 'jira' && args[1] === 'status' && args[2] === 'list') {
+      return {
+        ok: true,
+        result: {
+          transitions: [
+            { id: '90', name: "Won't Do", to: { name: "Won't Do", categoryKey: 'done' } },
+            { id: '91', name: 'Rejected', to: { name: 'Rejected', categoryKey: 'done' } },
+            { id: '92', name: 'Done', to: { name: 'Done', categoryKey: 'done' } }
+          ]
+        }
+      }
+    }
+    if (args[0] === 'jira' && args[1] === 'status' && args[2] === 'set') {
+      assert.equal(args[args.indexOf('--to-id') + 1], '92', 'Must pick Done (92), not Won\'t Do (90)')
+      return { ok: true, result: {} }
+    }
+    return { ok: true, result: {} }
+  })
+
+  const worker = await mountWorker(main, { host })
+  const originalFetch = globalThis.fetch
+  try {
+    await worker.request('tasks.sync', { provider: 'jira', scope: 'assigned' })
+    const jiraDone = await worker.request('tasks.transition', {
+      taskId: 'jira:F7-1',
+      targetCategory: 'done'
+    })
+    assert.equal(jiraDone.providerSynced, true)
+    assert.equal(jiraDone.task.status, 'Done')
+
+    // F8: Notion 401 returns providerSynced: false without updating local status
+    await worker.request('tasks.saveNotionToken', { token: 'ntn_test_token_123456' })
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url)
+      if (u.includes('/databases/')) {
+        return new Response(
+          JSON.stringify({
+            results: [
+              {
+                id: '11111111-1111-1111-1111-111111111111',
+                url: 'https://www.notion.so/not-801',
+                properties: {
+                  Name: { type: 'title', title: [{ plain_text: 'Notion 401 test' }] },
+                  Status: { type: 'status', status: { name: 'Not started' } },
+                  ID: { type: 'unique_id', unique_id: { prefix: 'NOT', number: 801 } }
+                }
+              }
+            ],
+            has_more: false
+          }),
+          { status: 200 }
+        )
+      }
+      if (init?.method === 'PATCH') {
+        return new Response(JSON.stringify({ code: 'unauthorized', message: 'API token is invalid.' }), { status: 401 })
+      }
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch
+
+    await worker.request('tasks.sync', { provider: 'notion', scope: 'assigned' })
+    const notionStateBefore = (await worker.request('tasks.getState')).tasks.find((t) => t.key === 'NOT-801')
+    assert.ok(notionStateBefore)
+    assert.equal(notionStateBefore.statusCategory, 'todo', 'F6: Notion "Not started" must be todo')
+
+    const notionTrans = await worker.request('tasks.transition', {
+      taskId: notionStateBefore.id,
+      targetCategory: 'in_review'
+    })
+    assert.equal(notionTrans.providerSynced, false, 'F8: Notion 401 must not report providerSynced: true')
+    assert.equal(notionTrans.task.status, 'Not started')
+
+    // F12: assigning to a different repo clears stale worktree/terminal links
+    await worker.request('tasks.dispatch', {
+      taskId: 'jira:F7-1',
+      createWorktree: false,
+      repoId: 'repoA',
+      requirePlanApproval: true,
+      enforcePlanLock: true
+    })
+    const reassigned = await worker.request('tasks.assignRepo', {
+      taskId: 'jira:F7-1',
+      repoId: 'repoB'
+    })
+    const f7AfterAssign = reassigned.state.tasks.find((t) => t.key === 'F7-1')
+    assert.equal(f7AfterAssign?.repoId, 'repoB')
+    assert.equal(f7AfterAssign?.linkedOrcaWorkspaceId, undefined)
+    assert.equal(f7AfterAssign?.linkedBranch, undefined)
+
+    // F16: sendCommentFeedback refuses without confirmNewSession when a live agent is running, and preserves planLock when confirmed
+    await worker.request('tasks.dispatch', {
+      taskId: 'jira:F7-1',
+      createWorktree: false,
+      repoId: 'repoB',
+      requirePlanApproval: true,
+      enforcePlanLock: true
+    })
+    liveAgents.push({
+      terminalId: 'term-f-new',
+      title: 'Claude',
+      agent: 'claude',
+      state: 'working',
+      stateStartedAt: Date.now()
+    })
+    await assert.rejects(() =>
+      worker.request('tasks.sendCommentFeedback', { taskId: 'jira:F7-1', customInstruction: 'Fix typo' })
+    )
+    const fbConfirmed = await worker.request('tasks.sendCommentFeedback', {
+      taskId: 'jira:F7-1',
+      customInstruction: 'Fix typo',
+      confirmNewSession: true
+    })
+    const f7AfterFb = fbConfirmed.state.tasks.find((t) => t.key === 'F7-1')
+    assert.equal(f7AfterFb?.planLockActive, true)
+  } finally {
+    globalThis.fetch = originalFetch
+    setCliRunnerForTests(null)
+    await worker.deactivate()
+  }
+})
+
+test('F5: detectPr ignores MERGED PRs and branch commits when 0 ahead of base branch', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tb-f5-git-'))
+  try {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: root, stdio: 'ignore' })
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: root, stdio: 'ignore' })
+    execFileSync('git', ['config', 'user.name', 'Test User'], { cwd: root, stdio: 'ignore' })
+    writeFileSync(path.join(root, 'README.md'), 'init\n', 'utf8')
+    execFileSync('git', ['add', '.'], { cwd: root, stdio: 'ignore' })
+    execFileSync('git', ['commit', '-m', 'chore: initial main commit should not leak'], { cwd: root, stdio: 'ignore' })
+    execFileSync('git', ['checkout', '-b', 'feat/f5-empty'], { cwd: root, stdio: 'ignore' })
+
+    const host = mockHost({
+      results: {
+        'workspace.readContext': { branch: 'feat/f5-empty', displayName: 'feat/f5-empty', terminals: [] },
+        'workspace.list': {
+          workspaces: [
+            {
+              id: 'repo1::' + root,
+              kind: 'worktree',
+              name: 'feat/f5-empty',
+              path: root,
+              branch: 'feat/f5-empty',
+              hostId: null
+            }
+          ],
+          truncated: false
+        },
+        'agent.launch': { terminalId: 'term-f5' },
+        'workspace.rename': null,
+        'notifications.show': null
+      }
+    })
+    setRepoToolRunnerForTests(async (exe, args, cwd) => {
+      if (exe === 'gh') {
+        return JSON.stringify({
+          url: 'https://github.com/acme/repo/pull/12',
+          state: 'MERGED',
+          title: 'Old merged PR'
+        })
+      }
+      try {
+        return execFileSync('git', [...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() || null
+      } catch {
+        return null
+      }
+    })
+
+    const worker = await mountWorker(main, { host })
+    const added = await worker.request('tasks.addManual', {
+      provider: 'linear',
+      key: 'F5-1',
+      title: 'Zero commits ahead'
+    })
+    await worker.request('tasks.dispatch', {
+      taskId: added.created.id,
+      createWorktree: false,
+      repoId: 'repo1',
+      customBranch: 'feat/f5-empty'
+    })
+    const prRes = await worker.request('tasks.detectPr', { taskId: added.created.id })
+    assert.equal(prRes.prUrl, null, 'MERGED PR must not be attached')
+    assert.equal(prRes.commitSummary.includes('initial main commit should not leak'), false)
+    assert.match(prRes.commitSummary, /No commits yet ahead of main/)
+    await worker.deactivate()
+  } finally {
+    setRepoToolRunnerForTests(null)
+    rmSync(root, { recursive: true, force: true })
   }
 })
