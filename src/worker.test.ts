@@ -3,8 +3,14 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
+import type { JsonValue } from 'orca/worker'
 import { buildAcVerificationPrompt, buildAgentPrompt, buildBranchName } from './protocol'
 import {
+  findDeniedGitWriteInToolCall,
+  isAcReviewerVerdictWrite,
+  isPlanLockToolAllowed,
+  isProposedAcFileWrite,
+  isReadOnlyShellCommand,
   redactSecrets,
   sanitizeBranchPrefix,
   sanitizeUntrustedText,
@@ -20,9 +26,11 @@ import {
   buildDiagnosticsReport,
   copyLocalSetupFiles,
   deriveUnassignedSprintJql,
+  extractSprintInfo,
   extractAcceptanceCriteriaFromText,
   mapIssueKind,
   mapStatusToCategory,
+  parseAgentJsonFile,
   parseJiraTasksResult,
   parseLinearTasksResult,
   scanRepoGuidelines,
@@ -944,7 +952,7 @@ test('dispatch prefers real Git worktrees over empty-branch folders and surfaces
 
   const cliCalls: string[][] = []
   setCliRunnerForTests(async (args) => {
-    cliCalls.push(args)
+    cliCalls.push([...args])
     if (args[0] === 'worktree' && args[1] === 'create') {
       const bIdx = args.indexOf('--branch')
       createdBranch = bIdx !== -1 ? args[bIdx + 1] : 'feat/lin-142'
@@ -1038,7 +1046,7 @@ test('multi-repo routing guards ambiguity, supports per-ticket assignRepo, and a
 
   const cliCalls: string[][] = []
   setCliRunnerForTests(async (args) => {
-    cliCalls.push(args)
+    cliCalls.push([...args])
     if (args[0] === 'worktree' && args[1] === 'create') {
       const repoFlag = args[args.indexOf('--repo') + 1] ?? ''
       const branch = args[args.indexOf('--branch') + 1] ?? 'feat/test'
@@ -1162,7 +1170,7 @@ test('uses --repo path:<path> --no-parent and --agent/--prompt on worktree creat
   const cliCalls: string[][] = []
   setCliLaunchForTests(true)
   setCliRunnerForTests(async (args) => {
-    cliCalls.push(args)
+    cliCalls.push([...args])
     if (args[0] === 'worktree' && args[1] === 'create') {
       createdBranch = args[args.indexOf('--branch') + 1] ?? 'feat/lin-142'
       return {
@@ -1323,7 +1331,7 @@ test('consecutive tasks.sync updates ticket statuses and never persists explicit
     // Dispatching a Notion ticket must NOT pass unsupported `app.notion.com` URL to `--reference`
     const notionWtCalls: string[][] = []
     setCliRunnerForTests(async (args) => {
-      notionWtCalls.push(args)
+      notionWtCalls.push([...args])
       if (args[0] === 'worktree' && args[1] === 'create') {
         createdNotionBranch = args[args.indexOf('--branch') + 1] ?? 'feat/san-1'
         return {
@@ -1422,8 +1430,16 @@ test('hydrates Linear subtasks, parent back-links, and acceptance criteria via l
   assert.deepEqual(parsedDetail[0]?.acceptanceCriteria, ['First check', 'Second check'])
   assert.equal(parsedDetail[0]?.children?.[0]?.assignee, 'Charly')
 
+  // (`workspaces` is not a MockHostOptions field and was silently ignored; answer `workspace.list` instead)
   const host = mockHost({
-    workspaces: [{ id: 'ws-api', name: 'demo-api', branch: 'main', kind: 'worktree', path: 'C:\\Repos\\demo-api' }]
+    results: {
+      'workspace.list': {
+        workspaces: [
+          { id: 'ws-api', name: 'demo-api', branch: 'main', kind: 'worktree', path: 'C:\\Repos\\demo-api', hostId: null }
+        ],
+        truncated: false
+      }
+    }
   })
   const worker = await mountWorker(main, { host })
 
@@ -2060,7 +2076,7 @@ test('S2: Plan-First Gate enforces read-only allowlist across agents/commands an
   await worker.deactivate()
   const restarted = await mountWorker(main, { host })
 
-  const mutatingCases: Array<{ agent: string; tool: string; input: Record<string, unknown> }> = [
+  const mutatingCases: Array<{ agent: string; tool: string; input: { [key: string]: JsonValue } }> = [
     { agent: 'claude', tool: 'PowerShell', input: { command: 'Set-Content src/a.ts "evil"' } },
     { agent: 'gemini', tool: 'write_file', input: { path: 'src/a.ts' } },
     { agent: 'gemini', tool: 'replace', input: { path: 'src/a.ts' } },
@@ -2097,7 +2113,7 @@ test('S2: Plan-First Gate enforces read-only allowlist across agents/commands an
     assert.equal(res.kind, 'deny', `Expected DENY for ${tc.agent}/${tc.tool}: ${JSON.stringify(tc.input)}`)
   }
 
-  const readOnlyCases: Array<{ agent: string; tool: string; input: Record<string, unknown> }> = [
+  const readOnlyCases: Array<{ agent: string; tool: string; input: { [key: string]: JsonValue } }> = [
     { agent: 'claude', tool: 'Read', input: { file_path: 'src/a.ts' } },
     { agent: 'gemini', tool: 'read_file', input: { path: 'src/a.ts' } },
     { agent: 'claude', tool: 'Bash', input: { command: 'rg "=>" src' } },
@@ -2205,7 +2221,7 @@ test('S3: unrelated workspaces do not inherit cachedActiveTask hooks or complete
   const sec3After = stateAfter.tasks.find((t) => t.key === 'SEC-3')
   assert.equal(sec3After?.agentState, 'working')
 
-  const completeMsg = await worker.command('taskBridge.completeActive')
+  const completeMsg = String(await worker.command('taskBridge.completeActive'))
   assert.match(completeMsg, /No ticket is linked to the active workspace/)
   await worker.deactivate()
 })
@@ -2313,7 +2329,7 @@ test('S6: demo tickets never send --reference, --reference-site, or transition/c
 
   const cliCalls: string[][] = []
   setCliRunnerForTests(async (args) => {
-    cliCalls.push(args)
+    cliCalls.push([...args])
     if (args[0] === 'jira' && args[1] === 'connection') {
       return {
         ok: true,
@@ -3313,7 +3329,7 @@ test('N1, N2, N3, A6, A7: discovers SKILL.md safely, enforces guard.denyGitWrite
 
     const cliCalls: string[][] = []
     setCliRunnerForTests(async (args) => {
-      cliCalls.push(args)
+      cliCalls.push([...args])
       if (args[0] === 'linear' && args[1] === 'list-issues') {
         return {
           ok: true,
@@ -3907,15 +3923,485 @@ test('0.3.2: deriveUnassignedSprintJql handles default JQL, assignee in (current
     'project in (ENG, PLAT) AND sprint in openSprints() AND assignee is EMPTY AND statusCategory != Done'
   )
 
-  // 5. Edge case with `OR`: strips the assignee condition and intersects with `AND assignee is EMPTY` so tickets assigned to others never leak
+  // 5. Edge case with `OR`: substitutes in place and intersects with `AND assignee is EMPTY`
+  //    so tickets assigned to others never leak and the JQL structure always stays valid
   assert.equal(
     deriveUnassignedSprintJql('assignee = currentUser() OR reporter = currentUser()'),
-    '(reporter = currentUser()) AND assignee is EMPTY'
+    '(assignee is EMPTY OR reporter = currentUser()) AND assignee is EMPTY'
   )
   assert.equal(
     deriveUnassignedSprintJql(
       'sprint in openSprints() AND (assignee = currentUser() OR reporter = currentUser()) ORDER BY rank'
     ),
-    '(sprint in openSprints() AND (reporter = currentUser())) AND assignee is EMPTY ORDER BY rank'
+    '(sprint in openSprints() AND (assignee is EMPTY OR reporter = currentUser())) AND assignee is EMPTY ORDER BY rank'
   )
+
+  // 6. Parenthesized assignee term next to OR must not leave a dangling operator
+  assert.equal(
+    deriveUnassignedSprintJql('(assignee = currentUser()) OR (reporter = currentUser())'),
+    '((assignee is EMPTY) OR (reporter = currentUser())) AND assignee is EMPTY'
+  )
+  assert.equal(
+    deriveUnassignedSprintJql(
+      'sprint in openSprints() AND (assignee = currentUser()) AND labels = x OR labels = y'
+    ),
+    '(sprint in openSprints() AND (assignee is EMPTY) AND labels = x OR labels = y) AND assignee is EMPTY'
+  )
+
+  // 7. JQL precedence (AND binds tighter than OR) is preserved: unassigned tickets in A or in B
+  assert.equal(
+    deriveUnassignedSprintJql('project = A AND assignee = currentUser() OR project = B'),
+    '(project = A AND assignee is EMPTY OR project = B) AND assignee is EMPTY'
+  )
+})
+
+test('0.3.3: Plan Lock shell classifier rejects command execution and file writes hidden in read-only commands', () => {
+  const bypasses = [
+    'echo "$(touch pwned)"',
+    'echo "`touch pwned`"',
+    'git -c core.fsmonitor="touch pwned" status',
+    'git -c diff.external=./x.sh diff',
+    'git --config-env=core.pager=EVIL log',
+    'git --exec-path=/tmp/evil status',
+    'git diff --ext-diff',
+    'git diff --output=src/a.ts',
+    'git log --output pwned.txt',
+    'git show --output=pwned.txt HEAD',
+    'git grep -Otouch foo',
+    'git grep --open-files-in-pager=vim foo',
+    'git branch --set-upstream-to=origin/x',
+    'git branch -uorigin/x',
+    'git branch new-branch',
+    'git branch -D old',
+    'rg --pre=./evil.sh foo',
+    'rg --pre ./evil.sh foo',
+    'ag --pager=./evil.sh foo',
+    'fd . -x rm',
+    'fd -HX rm',
+    'fd --exec rm',
+    'tree -o pwned.txt',
+    'tree -R -H .',
+    'file -C -m magic',
+    'gci | where { Remove-Item $_ }',
+    'echo (Remove-Item foo)',
+    'echo @(Remove-Item foo)',
+    '(rm -rf src)',
+    'ls; { rm -rf src; }',
+    'cat "$(rm -rf src)"'
+  ]
+  for (const cmd of bypasses) {
+    assert.equal(isReadOnlyShellCommand(cmd), false, `should block: ${cmd}`)
+    assert.equal(isPlanLockToolAllowed('claude', 'Bash', { command: cmd }), false, `hook should deny: ${cmd}`)
+  }
+
+  const readOnly = [
+    'git status',
+    'git log --oneline -n 5',
+    'git diff --stat HEAD~1',
+    'git -C ../repo log -1',
+    'git branch',
+    'git branch -a -vv',
+    'git branch --show-current',
+    'git branch --sort=-committerdate --format="%(refname:short)"',
+    'rg "fn main" src',
+    'rg -n "\\(" src',
+    "echo '$(not expanded in single quotes)'",
+    'fd -H -e ts',
+    'tree -L 2',
+    'cat package.json | head -n 20',
+    'Get-ChildItem src | Select-String "TODO"',
+    'find . -name "*.ts" -type f'
+  ]
+  for (const cmd of readOnly) {
+    assert.equal(isReadOnlyShellCommand(cmd), true, `should allow: ${cmd}`)
+  }
+})
+
+test('0.3.3: guard.denyGitWrites catches git invoked via paths, git.exe, wrappers and nested shells', () => {
+  const denied = ['push', 'commit']
+  const blocked = [
+    'git push',
+    'git -C ../repo push origin main',
+    '/usr/bin/git push',
+    'git.exe push',
+    'C:\\Program Files\\Git\\cmd\\git.exe push',
+    'env GIT_TRACE=1 git push',
+    'command git push',
+    'sh -c "git push"',
+    'bash -lc \'git commit -m wip\'',
+    'echo x | xargs git push',
+    'ls && git commit -am wip',
+    '(cd .. && git push)'
+  ]
+  for (const cmd of blocked) {
+    assert.ok(
+      findDeniedGitWriteInToolCall('Bash', { command: cmd }, denied),
+      `should deny git write in: ${cmd}`
+    )
+  }
+  assert.equal(findDeniedGitWriteInToolCall('Bash', { command: 'git status' }, denied), null)
+  assert.equal(findDeniedGitWriteInToolCall('Bash', { command: 'git log --grep=push' }, denied), null)
+  assert.equal(findDeniedGitWriteInToolCall('Read', { command: 'git push' }, denied), null)
+})
+
+test('0.3.3: AC reviewer/proposer may write their artifact via absolute paths (Claude Code Write) but nowhere else', () => {
+  const posixRoot = '/home/dev/worktrees/eng-1'
+  const winRoot = 'C:\\Users\\dev\\worktrees\\eng-1'
+
+  // Relative paths keep working
+  assert.equal(isAcReviewerVerdictWrite('Write', { file_path: '.orca/task-bridge/ac-ENG-1.json' }, 'ENG-1'), true)
+
+  // Absolute paths inside the reviewer's worktree (Claude Code always sends absolute `file_path`)
+  assert.equal(
+    isAcReviewerVerdictWrite('Write', { file_path: `${posixRoot}/.orca/task-bridge/ac-ENG-1.json` }, 'ENG-1', posixRoot),
+    true
+  )
+  assert.equal(
+    isAcReviewerVerdictWrite('Write', { file_path: `${winRoot}\\.orca\\task-bridge\\ac-ENG-1.json` }, 'ENG-1', winRoot),
+    true
+  )
+  assert.equal(
+    isProposedAcFileWrite(
+      'Write',
+      { file_path: `${posixRoot}/.orca/task-bridge/proposed-ac-ENG-1.json` },
+      'ENG-1',
+      posixRoot
+    ),
+    true
+  )
+
+  // Wrong worktree, wrong key, traversal, or a different file are all denied
+  assert.equal(
+    isAcReviewerVerdictWrite('Write', { file_path: '/home/dev/other/.orca/task-bridge/ac-ENG-1.json' }, 'ENG-1', posixRoot),
+    false
+  )
+  assert.equal(
+    isAcReviewerVerdictWrite('Write', { file_path: `${posixRoot}/.orca/task-bridge/ac-ENG-2.json` }, 'ENG-1', posixRoot),
+    false
+  )
+  assert.equal(
+    isAcReviewerVerdictWrite(
+      'Write',
+      { file_path: `${posixRoot}/src/../.orca/task-bridge/ac-ENG-1.json` },
+      'ENG-1',
+      posixRoot
+    ),
+    false
+  )
+  assert.equal(
+    isAcReviewerVerdictWrite('Write', { file_path: `${posixRoot}/src/index.ts` }, 'ENG-1', posixRoot),
+    false
+  )
+  assert.equal(
+    isAcReviewerVerdictWrite('Edit', { file_path: `${posixRoot}/.orca/task-bridge/ac-ENG-1.json` }, 'ENG-1', posixRoot),
+    false
+  )
+  assert.equal(
+    isProposedAcFileWrite('Write', { file_path: `${posixRoot}/.orca/task-bridge/ac-ENG-1.json` }, 'ENG-1', posixRoot),
+    false
+  )
+})
+
+test('0.3.3: a committed .task-bridge.json cannot switch off the user Plan Lock (enforcePlanLock:false / planGate:"skill")', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tb-lock-'))
+  try {
+    const repo = path.join(root, 'repo')
+    mkdirSync(repo, { recursive: true })
+    writeFileSync(
+      path.join(repo, '.task-bridge.json'),
+      JSON.stringify({ requirePlanApproval: false, enforcePlanLock: false, planGate: 'skill' }),
+      'utf8'
+    )
+    const wsId = 'repo1::' + repo
+    const host = mockHost({
+      settings: { requirePlanApproval: true, enforcePlanLock: true },
+      results: {
+        'workspace.readContext': { branch: 'main', displayName: 'main', terminals: [] },
+        'workspace.list': {
+          workspaces: [{ id: wsId, kind: 'worktree', name: 'main', path: repo, branch: 'main', hostId: null }],
+          truncated: false
+        },
+        'agent.launch': { terminalId: 'term-lock' },
+        'workspace.rename': null,
+        'notifications.show': null
+      }
+    })
+    const worker = await mountWorker(main, { host })
+    try {
+      const added = await worker.request('tasks.addManual', {
+        provider: 'linear',
+        key: 'SEC-9',
+        title: 'Repo config cannot relax the lock'
+      })
+      await worker.request('tasks.dispatch', {
+        taskId: added.created.id,
+        createWorktree: false,
+        repoId: 'repo1'
+      })
+      const res = await worker.hooks.fire('agent.tool.before', {
+        agent: 'claude',
+        workspaceId: wsId,
+        terminalId: 'term-lock',
+        tool: 'Write',
+        input: { file_path: path.join(repo, 'src', 'a.ts') }
+      })
+      assert.equal(res.kind, 'deny', 'user-enabled Plan Lock must survive a repo file that tries to disable it')
+    } finally {
+      await worker.deactivate()
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('0.3.3: approving the plan while dispatch is still running is not overwritten by the dispatch result', async () => {
+  let worker: Awaited<ReturnType<typeof mountWorker>> | null = null
+  let taskId = ''
+  const host = mockHost({
+    settings: { requirePlanApproval: true, enforcePlanLock: true },
+    results: {
+      'workspace.readContext': { branch: 'feat/sec-10', displayName: 'feat/sec-10', terminals: [] },
+      'workspace.list': {
+        workspaces: [
+          {
+            id: 'repo1::/repo/sec-10',
+            kind: 'worktree',
+            name: 'feat/sec-10',
+            path: '/repo/sec-10',
+            branch: 'feat/sec-10',
+            hostId: null
+          }
+        ],
+        truncated: false
+      },
+      // The agent is already running and the user approves its plan before dispatch finishes.
+      // (The test harness serializes worker requests, so apply what `tasks.approvePlan` stores directly.)
+      'agent.launch': () => {
+        const stored = host.data().storage.tasks as Array<Record<string, unknown>>
+        const target = stored.find((t) => t.id === taskId)
+        assert.ok(target, 'task must already be persisted before the agent launches')
+        assert.equal(target.planLockActive, true, 'lock must be active before the agent launches')
+        target.planApproved = true
+        target.planLockActive = false
+        return { terminalId: 'term-approve' }
+      },
+      'workspace.rename': null,
+      'notifications.show': null
+    }
+  })
+  worker = await mountWorker(main, { host })
+  try {
+    const added = await worker.request('tasks.addManual', {
+      provider: 'linear',
+      key: 'SEC-10',
+      title: 'Approval during dispatch'
+    })
+    taskId = added.created.id
+    const res = await worker.request('tasks.dispatch', {
+      taskId,
+      createWorktree: false,
+      repoId: 'repo1'
+    })
+    const task = res.state.tasks.find((t) => t.id === taskId)
+    assert.equal(task?.planApproved, true, 'approval made during dispatch must be kept')
+    assert.equal(task?.planLockActive, false)
+    assert.equal(task?.linkedTerminalId, 'term-approve')
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('0.3.3: with Plan Lock enforced the agent is launched only after the lock and workspace link are active', async () => {
+  const wsList: Array<{ id: string; kind: 'worktree'; name: string; path: string; branch: string; hostId: null }> = [
+    { id: 'repo1::/repo/main', kind: 'worktree', name: 'main', path: '/repo/main', branch: 'main', hostId: null }
+  ]
+  const host = mockHost({
+    settings: { requirePlanApproval: true, enforcePlanLock: true },
+    results: {
+      'workspace.readContext': { branch: 'main', displayName: 'main', terminals: [] },
+      'workspace.list': () => ({ workspaces: wsList, truncated: false }),
+      'workspace.rename': null,
+      'notifications.show': null
+    }
+  })
+
+  let worker: Awaited<ReturnType<typeof mountWorker>> | null = null
+  const createArgs: string[][] = []
+  let hookResultAtLaunch: string | null = null
+  setCliLaunchForTests(true)
+  setCliRunnerForTests(async (args) => {
+    if (args[0] === 'worktree' && args[1] === 'create') {
+      createArgs.push([...args])
+      const branch = args[args.indexOf('--branch') + 1]
+      wsList.push({ id: 'repo1::/repo/wt-sec-11', kind: 'worktree', name: branch, path: '/repo/wt-sec-11', branch, hostId: null })
+      return { ok: true, result: { worktree: { id: 'repo1::/repo/wt-sec-11', path: '/repo/wt-sec-11' } } }
+    }
+    if (args[0] === 'agent' && args[1] === 'launch') {
+      // The very first tool call of the new agent must already be locked
+      const res = await worker!.hooks.fire('agent.tool.before', {
+        agent: 'claude',
+        workspaceId: 'repo1::/repo/wt-sec-11',
+        tool: 'Write',
+        input: { file_path: '/repo/wt-sec-11/src/a.ts' }
+      })
+      hookResultAtLaunch = res.kind
+      return { ok: true, result: { launch: { outcome: { kind: 'terminal', handle: 'term-sec-11' } } } }
+    }
+    return { ok: true, result: {} }
+  })
+
+  worker = await mountWorker(main, { host })
+  try {
+    const added = await worker.request('tasks.addManual', {
+      provider: 'linear',
+      key: 'SEC-11',
+      title: 'Lock before launch'
+    })
+    await worker.request('tasks.dispatch', { taskId: added.created.id, createWorktree: true, repoId: 'repo1' })
+    assert.equal(createArgs.length, 1)
+    assert.ok(!createArgs[0].includes('--agent'), 'worktree create must not start the agent while Plan Lock is enforced')
+    assert.equal(hookResultAtLaunch, 'deny', 'agent.tool.before must already deny writes when the agent starts')
+  } finally {
+    setCliLaunchForTests(false)
+    setCliRunnerForTests(null)
+    await worker.deactivate()
+  }
+})
+
+test('0.3.3: a Notion transition without token or page id is reported as not synced and keeps the local status', async () => {
+  const host = mockHost({
+    results: {
+      'workspace.readContext': null,
+      'workspace.list': { workspaces: [], truncated: false },
+      'notifications.show': null
+    }
+  })
+  const worker = await mountWorker(main, { host })
+  try {
+    const added = await worker.request('tasks.addManual', {
+      provider: 'notion',
+      key: 'NOT-77',
+      title: 'Notion without token'
+    })
+    const res = await worker.request('tasks.transition', {
+      taskId: added.created.id,
+      targetCategory: 'in_review'
+    })
+    assert.equal(res.providerSynced, false)
+    assert.match(res.summary, /on NOTION: Notion token is not configured/)
+    const task = res.state.tasks.find((t) => t.id === added.created.id)
+    assert.equal(task?.statusCategory, 'todo', 'local status must not move when Notion was not updated')
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('0.3.3: hardening helpers — agent JSON fallback, repo paths, URLs, secrets, sprints and Unicode branch keywords', () => {
+  // Windows prompts turn `"` into `'`: verdict files written with single quotes must still parse
+  assert.deepEqual(
+    parseAgentJsonFile(`{'verdict': 'READY_FOR_REVIEW', 'summary': 'it's done', 'items': []}`),
+    { verdict: 'READY_FOR_REVIEW', summary: "it's done", items: [] }
+  )
+  assert.deepEqual(parseAgentJsonFile('{"criteria": ["A"]}'), { criteria: ['A'] })
+  assert.throws(() => parseAgentJsonFile('not json'))
+
+  // `.git` anywhere, Windows trailing dots/spaces and alternate data streams are rejected
+  assert.equal(validateRelativeRepoPath('sub/.git/config'), null)
+  assert.equal(validateRelativeRepoPath('.git./config'), null)
+  assert.equal(validateRelativeRepoPath('.GIT /hooks/pre-commit'), null)
+  assert.equal(validateRelativeRepoPath('.env.local:secret'), null)
+  assert.equal(validateRelativeRepoPath('... /x'), null)
+  assert.equal(validateRelativeRepoPath('.github/pull_request_template.md'), '.github/pull_request_template.md')
+  assert.equal(validateRelativeRepoPath('.gitignore'), '.gitignore')
+
+  // Query strings with `&` are valid links; quotes/backticks still are not
+  assert.equal(
+    validateHttpsUrl('https://www.notion.so/acme/abc?v=1&p=2'),
+    'https://www.notion.so/acme/abc?v=1&p=2'
+  )
+  assert.equal(validateHttpsUrl('https://example.com/`whoami`'), null)
+  assert.equal(validateHttpsUrl(42), null)
+
+  // Additional credential formats are redacted
+  const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U'
+  assert.ok(!redactSecrets(`token=${jwt}`).includes(jwt))
+  assert.ok(!redactSecrets('lin_oauth_abcdefghijklmnop1234').includes('lin_oauth_abcdefghijklmnop1234'))
+
+  // A ticket that only carries past sprints is not reported as being in an active sprint
+  assert.equal(extractSprintInfo({ fields: { closedSprints: ['Sprint 40'] } }, 'jira'), null)
+  assert.equal(
+    extractSprintInfo({ sprint: 'Sprint 42', fields: { closedSprints: ['Sprint 40'] } }, 'jira')?.name,
+    'Sprint 42'
+  )
+
+  // Branch type keywords with accents match whole words
+  const fixTask = {
+    key: 'ENG-5',
+    title: 'Corrección del login',
+    kind: 'feature',
+    issueType: 'Story',
+    project: 'ENG'
+  } as unknown as Parameters<typeof buildBranchName>[0]
+  const branch = buildBranchName(fixTask, {
+    branchTemplate: '{prefix}/{key}-{slug}',
+    featurePrefix: 'feat',
+    branchTypes: [{ prefix: 'fix', keywords: ['corrección'] }]
+  })
+  assert.ok(branch.startsWith('fix/'), `expected fix/ prefix, got ${branch}`)
+})
+
+test('0.3.3: Jira completion comment is only posted after the status transition succeeds', async () => {
+  const cliCalls: string[][] = []
+  let statusSetOk = false
+  setCliRunnerForTests(async (args) => {
+    cliCalls.push([...args])
+    if (args[0] === 'jira' && args[1] === 'status' && args[2] === 'set') {
+      return statusSetOk
+        ? { ok: true, result: {} }
+        : { ok: false, error: { message: 'Transition is not available' } }
+    }
+    return { ok: false, error: { message: 'not mocked' } }
+  })
+  const host = mockHost({
+    results: {
+      'workspace.readContext': null,
+      'workspace.list': { workspaces: [], truncated: false },
+      'notifications.show': null
+    }
+  })
+  const worker = await mountWorker(main, { host })
+  try {
+    const added = await worker.request('tasks.addManual', { provider: 'jira', key: 'ENG-90', title: 'Comment order' })
+    const failed = await worker.request('tasks.transition', {
+      taskId: added.created.id,
+      targetCategory: 'in_review',
+      comment: 'Ready for review'
+    })
+    assert.equal(failed.providerSynced, false)
+    assert.match(failed.summary, /on JIRA: Transition is not available/)
+    assert.equal(
+      cliCalls.filter((c) => c[0] === 'jira' && c[1] === 'comment').length,
+      0,
+      'no comment may be posted when the transition failed'
+    )
+
+    statusSetOk = true
+    const ok = await worker.request('tasks.transition', {
+      taskId: added.created.id,
+      targetCategory: 'in_review',
+      comment: 'Ready for review'
+    })
+    assert.equal(ok.providerSynced, true)
+    assert.equal(cliCalls.filter((c) => c[0] === 'jira' && c[1] === 'comment').length, 1)
+
+    await assert.rejects(
+      worker.request('tasks.transition', {
+        taskId: added.created.id,
+        targetCategory: 'shipped' as unknown as 'done'
+      })
+    )
+  } finally {
+    setCliRunnerForTests(null)
+    await worker.deactivate()
+  }
 })

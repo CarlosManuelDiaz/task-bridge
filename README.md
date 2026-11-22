@@ -7,7 +7,7 @@ Keep **Linear**, **Jira**, and **Notion** within reach in the Orca ADE right sid
 | Field | Value |
 | --- | --- |
 | Plugin ID | `task-bridge` |
-| Version | `0.3.2` |
+| Version | `0.3.3` |
 | Orca Requirement | `>=1.4.256` |
 | Execution | `trusted-worker` (`pluginApi: 1`) |
 | UI Mode | Declarative host-rendered `components` (`@stablyai/orca-plugin-sdk/ui`) |
@@ -122,10 +122,10 @@ Task Bridge reuses Orca's native **Linear** and **Jira** integrations (no duplic
 - **Coding Agent Auto-Detection & Antigravity (`agy`) Support**: Supports **Antigravity (`agy`)**, **Claude Code**, **Codex**, **Gemini CLI**, and **Cursor CLI**, automatically checking `PATH` availability (`cliFound`) and provisioning isolated Git worktrees + visible agent terminals across macOS, Linux, and Windows PowerShell.
 - **Automatic Repo Instruction Detection**: Scans the active repository for `CLAUDE.md`, `.claude/CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.github/copilot-instructions.md`, `.orca/instructions.md`, and `.github/pull_request_template.md`, injecting `<repository_guidelines>` with explicit rule precedence and Conventional Commit / PR template reminders.
 - **Custom Branch Templates & Per-Repo Profiles (`tasks.saveRepoProfile`)**: Configure custom prefixes (`feature`, `bugfix`, `chore`) and branch templates with `{prefix}`, `{key}`, `{KEY}`, `{slug}`, `{project}`, `{PROJECT}`, and `{type}` globally or per `repoId`, or click **Apply Detected Guidelines** to adopt conventions found in `CLAUDE.md`.
-- **Local Untracked Setup File Copying**: Safely copies local config files (e.g., `.env.local`, `.claude/settings.local.json`) from the primary worktree into newly created worktrees (`validateRelativeRepoPath` blocks `..` traversal, symlinks, absolute paths, and `.git`).
+- **Local Untracked Setup File Copying**: Safely copies local config files (e.g., `.env.local`, `.claude/settings.local.json`) from the primary worktree into newly created worktrees (`validateRelativeRepoPath` blocks `..` traversal, absolute paths, and `.git`; `copyLocalSetupFiles` refuses symlinks and sources that resolve outside the primary worktree).
 
 ### 6. Mandatory Plan-First Gate & Ticket Comment Feedback Loop
-- **Plan-First Gate & Tool Lock (`tasks.approvePlan` + `agent.tool.before`)**: Require agents to present an implementation plan before coding. With **Enforce Plan Lock** enabled, `agent.tool.before` denies `Edit`/`Write`/file-mutating tools and mutating `Bash` commands in Claude Code until you click **Approve Plan** in Queue, Fleet, or Workbench (read-only exploration like `Read`, `git status`, and `rg` remains allowed). On cold worker activation, startup lookup and repository config hydration are bounded by a 400ms race so `agent.tool.before` never hits Orca's 2000ms hook timeout (if cold storage/workspace hydration exceeds 400ms during the first tool call after a restart, the hook fails open for that window until hydration finishes).
+- **Plan-First Gate & Tool Lock (`tasks.approvePlan` + `agent.tool.before`)**: Require agents to present an implementation plan before coding. With **Enforce Plan Lock** enabled, `agent.tool.before` denies `Edit`/`Write`/file-mutating tools and mutating `Bash` commands in Claude Code until you click **Approve Plan** in Queue, Fleet, or Workbench (read-only exploration like `Read`, `git status`, and `rg` remains allowed; shell commands that hide command execution or file writes — `$(...)`/backticks even inside double quotes, subshells, PowerShell `(...)`/`{...}`, `git -c`, `git --output`/`--ext-diff`, `rg --pre`, `fd -x`, `tree -o` — are denied). On cold worker activation, startup lookup and repository config hydration are bounded by a 400ms race so `agent.tool.before` never hits Orca's 2000ms hook timeout; if hydration takes longer, the hook **fails closed** for mutating tool calls (read-only calls still pass) until hydration finishes, capped at 10 seconds.
 - **Ticket Comment Feedback Loop (`tasks.sendCommentFeedback`) & Fleet Auto-Sync**: Periodically refreshes active Fleet tickets (`autoSyncMinutes`, default `5m`), pulls new Jira/Linear/Notion comments with an unread badge, and forwards reviewer feedback (isolated inside `<untrusted_ticket_data>`) to the linked workspace agent.
 
 ---
@@ -138,7 +138,7 @@ Task Bridge is engineered from the ground up so it cannot compromise developer m
    - All Orca CLI calls (`orca jira`, `orca linear`, `orca worktree`) and repository inspection calls (`git`, `gh`) execute via `node:child_process.execFile` with explicit argument arrays, `windowsHide: true`, bounded `maxBuffer`, and strict timeouts (`src/worker.ts`).
    - Shell metacharacters (`;`, `|`, `&`, `` ` ``, `$()`, newlines) in ticket titles, descriptions, or keys are never interpreted by a shell.
 2. **Strict Input & Identifier Validation (`src/security.ts`)**
-   - **Ticket Keys**: Validated against `^[A-Z0-9]+-[A-Z0-9]+$` (`validateTicketKey`) before passing to any CLI command.
+   - **Ticket Keys**: Validated against `^[A-Z][A-Z0-9_]{0,11}-[A-Z0-9]{1,12}$` (`validateTicketKey`) before passing to any CLI command.
    - **Branch Slugs**: Validated against git-check-ref-format rules (`validateBranchName`), blocking `..`, `@{`, leading `-`, and control characters.
    - **Agent Allowlist**: Only `antigravity`, `claude`, `codex`, `gemini`, and `cursor` are permitted (`validateAgentName`).
    - **HTTPS-Only URLs**: Ticket links and Pull Request URLs are parsed with `new URL()` and restricted to `https:` (`validateHttpsUrl`), preventing `javascript:`, `file:`, or `data:` URI injection.
@@ -155,12 +155,12 @@ Task Bridge is engineered from the ground up so it cannot compromise developer m
 
 ## Repository Configuration (`.task-bridge.json`)
 
-Repositories can commit an optional `.task-bridge.json` at the repo root to share team conventions across developers (`defaults < .task-bridge.json < user RepoProfile overrides`):
+Repositories can commit an optional `.task-bridge.json` at the repo root to share team conventions across developers (`defaults < .task-bridge.json < user RepoProfile overrides`). Security settings are the exception: `requirePlanApproval` / `enforcePlanLock` in the repo file can only turn the plan gate **on**, never off, and `planGate: "skill"` keeps the plugin gate active (`both`) when you enabled it yourself:
 
 - **Branch naming & type rules**: `branchTemplate`, `featurePrefix`, `bugPrefix`, `chorePrefix`, and `branchTypes` (`prefix`, `keywords`, `issueTypes`).
 - **Custom ticket parsing & statuses**: `acceptanceCriteriaHeadings` and `statusAliases` (`inProgress`, `inReview`, `done`).
 - **Worktree setup & subtasks**: `worktreeCopyFiles`, allowlisted `worktreeSetupCommands` (e.g. `npm ci`, `pnpm install --frozen-lockfile`, `composer install`, `uv sync` — gated behind explicit SHA-256 hash approval in Workbench), and `subtaskBase` (`"default" | "parent" | "chain"`).
-- **Workflow skills & guards**: `workflow` phase skill mappings (`dispatch`, `verify`, `feedback`, `prFeedback`), `planGate` (`"plugin" | "skill" | "both"`), and `guard.denyGitWrites` (blocks specific `git` subcommands like `push` across agents).
+- **Workflow skills & guards**: `workflow` phase skill mappings (`dispatch`, `verify`, `feedback`, `prFeedback`), `planGate` (`"plugin" | "skill" | "both"`), and `guard.denyGitWrites` (blocks specific `git` subcommands like `push` across agents, including `git` invoked by path, as `git.exe`, through `env`/`command`/`xargs`, or inside `sh -c "..."`; it is a best-effort guard, not a sandbox).
 
 ---
 
@@ -178,7 +178,14 @@ Repositories can commit an optional `.task-bridge.json` at the repo root to shar
 
 ## Development & Verification
 
-Run the full Orca plugin verification suite from the repository root:
+Type-check and run the whole verification suite from the plugin folder (TypeScript and `@types/node` are dev-only dependencies; Orca loads the sources directly):
+
+```bash
+npm install
+npm run verify   # typecheck + validate + check + test
+```
+
+Or run each Orca step from the repository root:
 
 ```bash
 # 1. Validate manifest schema, capabilities, and image asset dimensions

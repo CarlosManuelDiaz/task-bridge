@@ -17,6 +17,10 @@ const SECRET_PATTERNS: readonly RegExp[] = [
   /\bntn_[A-Za-z0-9]{12,}\b/g,
   /\bsecret_[A-Za-z0-9]{16,}\b/g,
   /\blin_api_[A-Za-z0-9]{16,}\b/g,
+  /\blin_oauth_[A-Za-z0-9]{16,}\b/g,
+  // JSON Web Tokens (OAuth access/ID tokens): header.payload.signature, header always starts with `eyJ`
+  /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
   /\bsk-[A-Za-z0-9_-]{20,}\b/g,
@@ -33,7 +37,10 @@ const SAFE_BRANCH_REGEX = /^[A-Za-z0-9]+(?:[._/-][A-Za-z0-9]+)*$/
 const SAFE_PREFIX_REGEX = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,23}$/
 const NOTION_ID_REGEX =
   /^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$/
-const UNSAFE_URL_CHARS = /['"`$;&|<>\\\s\u0000-\u001F\u007F]/
+// URLs only ever reach `execFile` argument arrays (never a shell), so query separators such as `&`, `;`
+// and `$` are allowed (Notion/Jira links use them). Quotes, angle brackets, backticks, pipes, backslashes,
+// whitespace and control bytes stay rejected so a URL can never break out of prompt or Markdown text.
+const UNSAFE_URL_CHARS = /['"`|<>\\\s\u0000-\u001F\u007F]/
 
 /**
  * Strips ANSI/OSC terminal escape codes, control and zero-width/bidi invisible characters,
@@ -140,10 +147,14 @@ export function validateRelativeRepoPath(rawPath: string | undefined): string | 
     return null
   }
   const segments = normalized.split('/').filter(Boolean)
+  // Windows silently drops trailing dots/spaces (`.git.` is `.git`, `.. ` is `..`) and `:` opens an
+  // alternate data stream, so compare segments the way the filesystem will resolve them.
+  const resolvedSegment = (seg: string) => seg.replace(/[. ]+$/, '').toLowerCase()
   if (
     segments.length === 0 ||
-    segments.some((seg) => seg === '.' || seg === '..') ||
-    segments[0].toLowerCase() === '.git'
+    normalized.includes(':') ||
+    segments.some((seg) => seg === '.' || seg === '..' || /^[. ]+$/.test(seg)) ||
+    segments.some((seg) => resolvedSegment(seg) === '.git')
   ) {
     return null
   }
@@ -153,8 +164,8 @@ export function validateRelativeRepoPath(rawPath: string | undefined): string | 
 /**
  * Validates an HTTPS URL and ensures it contains no shell metacharacters or control bytes.
  */
-export function validateHttpsUrl(rawUrl: string | undefined): string | null {
-  if (!rawUrl) return null
+export function validateHttpsUrl(rawUrl: unknown): string | null {
+  if (typeof rawUrl !== 'string' || !rawUrl) return null
   const trimmed = rawUrl.trim()
   if (!trimmed || trimmed.length > 512 || UNSAFE_URL_CHARS.test(trimmed)) {
     return null
@@ -309,20 +320,87 @@ const FIND_MUTATING_FLAGS = new Set([
   '-fls'
 ])
 
-const GIT_BRANCH_MUTATING_FLAGS = new Set([
-  '-d',
-  '-D',
-  '-m',
-  '-M',
-  '-c',
-  '-C',
-  '--delete',
-  '--move',
-  '--copy',
-  '--edit-description',
-  '--set-upstream-to',
-  '--unset-upstream'
+// `git branch` is only allowed in listing mode: every argument must be one of these flags (values via `=` only)
+const GIT_BRANCH_LIST_FLAGS = new Set([
+  '-a',
+  '--all',
+  '-r',
+  '--remotes',
+  '-v',
+  '-vv',
+  '--verbose',
+  '-l',
+  '--list',
+  '--show-current',
+  '--color',
+  '--no-color',
+  '--column',
+  '--no-column',
+  '-i',
+  '--ignore-case',
+  '--omit-empty',
+  '--no-abbrev'
 ])
+
+const GIT_BRANCH_LIST_FLAG_PREFIXES = [
+  '--sort=',
+  '--format=',
+  '--color=',
+  '--column=',
+  '--contains=',
+  '--no-contains=',
+  '--merged=',
+  '--no-merged=',
+  '--points-at=',
+  '--abbrev='
+]
+
+// Git global options that can run arbitrary programs (`-c core.fsmonitor=...`, `-c diff.external=...`)
+function isDangerousGitGlobalOption(tok: string): boolean {
+  return tok === '-c' || tok.startsWith('--config-env') || tok.startsWith('--exec-path')
+}
+
+// Subcommand arguments that write files (`--output`) or spawn external programs (`--ext-diff`, `-O<pager>`)
+function isDangerousGitSubcommandArg(tok: string): boolean {
+  return (
+    tok === '--output' ||
+    tok.startsWith('--output=') ||
+    tok === '--ext-diff' ||
+    tok.startsWith('--open-files-in-pager') ||
+    /^-O/.test(tok)
+  )
+}
+
+// Per-binary arguments that run commands or write files even though the binary itself is read-only
+function hasDangerousReadOnlyCommandArg(bin: string, args: readonly string[]): boolean {
+  for (const arg of args) {
+    const isShortCluster = /^-[A-Za-z]+$/.test(arg)
+    switch (bin) {
+      case 'rg':
+        // `--pre <cmd>` runs an arbitrary preprocessor for every searched file
+        if (arg.startsWith('--pre')) return true
+        break
+      case 'ag':
+        if (arg.startsWith('--pager')) return true
+        break
+      case 'fd':
+        // `-x/--exec` and `-X/--exec-batch` run a command for each match
+        if (arg.startsWith('--exec') || (isShortCluster && /[xX]/.test(arg))) return true
+        break
+      case 'tree':
+        // `-o <file>` writes its output, `-R` writes 00Tree.html into every directory
+        if (isShortCluster && /[oR]/.test(arg)) return true
+        break
+      case 'file':
+        // `-C` compiles a magic file into the current directory
+        if (arg === '--compile' || (isShortCluster && arg.includes('C'))) return true
+        break
+      default:
+        break
+    }
+  }
+  return false
+}
 
 function extractCommandTextForPlanLock(input: unknown): string {
   if (typeof input === 'string') return input
@@ -348,6 +426,10 @@ function splitShellSegmentsAndCheckUnquotedMeta(cmd: string): string[] | null {
     const nextCh = cmd[i + 1] ?? ''
 
     if (quote) {
+      // Bash and PowerShell still expand `$(...)` and backticks inside double quotes
+      if (quote === '"' && (ch === '`' || (ch === '$' && nextCh === '('))) {
+        return null
+      }
       if (ch === '\\' && quote === '"' && i + 1 < cmd.length) {
         current += ch + nextCh
         i += 1
@@ -373,6 +455,11 @@ function splitShellSegmentsAndCheckUnquotedMeta(cmd: string): string[] | null {
       (ch === '$' && nextCh === '(') ||
       (ch === '<' && nextCh === '(')
     ) {
+      return null
+    }
+
+    // Reject unquoted subshells, PowerShell subexpressions `(...)` / `@(...)` and script blocks `{...}`
+    if (ch === '(' || ch === ')' || ch === '{' || ch === '}') {
       return null
     }
 
@@ -449,7 +536,8 @@ function isAllowedGitReadSegment(tokens: string[]): boolean {
   while (idx < tokens.length) {
     const tok = tokens[idx]
     if (!tok.startsWith('-')) break
-    if (tok === '-C' || tok === '--git-dir' || tok === '--work-tree' || tok === '-c') {
+    if (isDangerousGitGlobalOption(tok)) return false
+    if (tok === '-C' || tok === '--git-dir' || tok === '--work-tree') {
       idx += 2
       continue
     }
@@ -457,11 +545,16 @@ function isAllowedGitReadSegment(tokens: string[]): boolean {
   }
   const subcommand = tokens[idx]?.toLowerCase() ?? ''
   if (!ALLOWED_GIT_READ_SUBCOMMANDS.has(subcommand)) return false
+  const args = tokens.slice(idx + 1)
+  if (args.some(isDangerousGitSubcommandArg)) return false
   if (subcommand === 'branch') {
-    for (let i = idx + 1; i < tokens.length; i += 1) {
-      const arg = tokens[i]
-      if (GIT_BRANCH_MUTATING_FLAGS.has(arg)) return false
-      if (!arg.startsWith('-')) return false
+    for (const arg of args) {
+      if (
+        !GIT_BRANCH_LIST_FLAGS.has(arg) &&
+        !GIT_BRANCH_LIST_FLAG_PREFIXES.some((prefix) => arg.startsWith(prefix))
+      ) {
+        return false
+      }
     }
   }
   return true
@@ -496,6 +589,9 @@ export function isReadOnlyShellCommand(cmd: string): boolean {
       continue
     }
     if (!ALLOWED_READ_ONLY_COMMANDS.has(bin)) {
+      return false
+    }
+    if (hasDangerousReadOnlyCommandArg(bin, tokens.slice(1))) {
       return false
     }
   }
@@ -580,20 +676,24 @@ export function findDeniedGitWriteInToolCall(
   if (!cmd.trim()) return null
 
   const deniedSet = new Set(deniedGitSubcommands.map((s) => s.trim().toLowerCase()).filter(Boolean))
-  const segments = splitShellSegmentsAndCheckUnquotedMeta(cmd)
-  if (!segments) {
-    // Unquoted subshells/redirections could hide git writes; fall back to token scan
-    const match = /\bgit\s+(?:-C\s+\S+\s+)*([a-z-]+)/i.exec(cmd)
-    if (match?.[1] && deniedSet.has(match[1].toLowerCase())) {
-      return match[1].toLowerCase()
-    }
-    return null
+
+  // Backstop scan over the raw command text: catches git invoked through paths (`/usr/bin/git`),
+  // `git.exe`, wrappers (`env`, `command`, `xargs`), nested shells (`sh -c "git push"`) and subshells.
+  const rawGitInvocation =
+    /(?:^|[\s;&|('"`/\\=])git(?:\.exe)?['"]?\s+((?:(?:-C|-c|--git-dir|--work-tree)\s+\S+\s+|-\S+\s+)*)([A-Za-z][\w-]*)/gi
+  for (const match of cmd.matchAll(rawGitInvocation)) {
+    const sub = match[2]?.toLowerCase()
+    if (sub && deniedSet.has(sub)) return sub
   }
+
+  const segments = splitShellSegmentsAndCheckUnquotedMeta(cmd)
+  if (!segments) return null
 
   for (const segment of segments) {
     const tokens = tokenizeSimpleShellSegment(segment)
     if (!tokens || tokens.length === 0) continue
-    if (tokens[0].toLowerCase() !== 'git') continue
+    const bin = tokens[0].replace(/\\/g, '/').split('/').pop()?.toLowerCase() ?? ''
+    if (bin !== 'git' && bin !== 'git.exe') continue
     let idx = 1
     while (idx < tokens.length) {
       const tok = tokens[idx]
@@ -612,33 +712,68 @@ export function findDeniedGitWriteInToolCall(
   return null
 }
 
+function extractWriteTargetPath(input: unknown): string {
+  if (!input || typeof input !== 'object') return ''
+  const obj = input as Record<string, unknown>
+  for (const field of ['file_path', 'path', 'TargetFile', 'target_file']) {
+    const val = obj[field]
+    if (typeof val === 'string') return val
+  }
+  return ''
+}
+
+function normalizeSlashPath(raw: string): string {
+  return raw.trim().replace(/\\/g, '/').replace(/\/+$/, '')
+}
+
+/**
+ * Checks that a write targets exactly `.orca/task-bridge/<fileName>` inside the agent's worktree.
+ * Accepts repo-relative paths and absolute paths (Claude Code's `Write` always sends absolute paths).
+ * When `workspaceRoot` is known, absolute paths must resolve to `<workspaceRoot>/.orca/task-bridge/<fileName>`.
+ */
+function isTaskBridgeArtifactWrite(
+  rawPath: string,
+  fileName: string,
+  workspaceRoot?: string | null
+): boolean {
+  if (!rawPath || /[\u0000-\u001F\u007F]/.test(rawPath)) return false
+  const suffix = `.orca/task-bridge/${fileName}`.toLowerCase()
+  const normalized = normalizeSlashPath(rawPath)
+  const isAbsolute = normalized.startsWith('/') || /^[A-Za-z]:\//.test(normalized)
+
+  if (!isAbsolute) {
+    const rel = validateRelativeRepoPath(rawPath)
+    if (!rel) return false
+    const lower = rel.toLowerCase()
+    return lower === suffix || lower.endsWith(`/${suffix}`)
+  }
+
+  const segments = normalized.split('/')
+  if (segments.some((seg, i) => (seg === '.' || seg === '..') && i > 0)) return false
+  const lower = normalized.toLowerCase()
+  if (!lower.endsWith(`/${suffix}`)) return false
+  if (!workspaceRoot) return true
+  const root = normalizeSlashPath(workspaceRoot)
+  if (!root || root === '.') return true
+  return lower === `${root.toLowerCase()}/${suffix}`
+}
+
 /**
  * Allows an AC Reviewer session to write ONLY its `.orca/task-bridge/ac-<KEY>.json` verdict file.
  */
 export function isAcReviewerVerdictWrite(
   toolName: string,
   input: unknown,
-  expectedTicketKey: string
+  expectedTicketKey: string,
+  workspaceRoot?: string | null
 ): boolean {
   if (!AC_VERDICT_WRITE_TOOLS.has(toolName.trim().toLowerCase())) return false
-  if (!input || typeof input !== 'object') return false
-  const obj = input as Record<string, unknown>
-  const rawPath =
-    typeof obj.file_path === 'string'
-      ? obj.file_path
-      : typeof obj.path === 'string'
-        ? obj.path
-        : typeof obj.TargetFile === 'string'
-          ? obj.TargetFile
-          : typeof obj.target_file === 'string'
-            ? obj.target_file
-            : ''
-  const rel = validateRelativeRepoPath(rawPath)
   const safeKey = validateTicketKey(expectedTicketKey)
-  if (!rel || !safeKey) return false
-  return (
-    rel.toLowerCase() === `.orca/task-bridge/ac-${safeKey.toLowerCase()}.json` ||
-    rel.toLowerCase().endsWith(`/.orca/task-bridge/ac-${safeKey.toLowerCase()}.json`)
+  if (!safeKey) return false
+  return isTaskBridgeArtifactWrite(
+    extractWriteTargetPath(input),
+    `ac-${safeKey.toLowerCase()}.json`,
+    workspaceRoot
   )
 }
 
@@ -648,27 +783,15 @@ export function isAcReviewerVerdictWrite(
 export function isProposedAcFileWrite(
   toolName: string,
   input: unknown,
-  expectedTicketKey: string
+  expectedTicketKey: string,
+  workspaceRoot?: string | null
 ): boolean {
   if (!AC_VERDICT_WRITE_TOOLS.has(toolName.trim().toLowerCase())) return false
-  if (!input || typeof input !== 'object') return false
-  const obj = input as Record<string, unknown>
-  const rawPath =
-    typeof obj.file_path === 'string'
-      ? obj.file_path
-      : typeof obj.path === 'string'
-        ? obj.path
-        : typeof obj.TargetFile === 'string'
-          ? obj.TargetFile
-          : typeof obj.target_file === 'string'
-            ? obj.target_file
-            : ''
-  const rel = validateRelativeRepoPath(rawPath)
   const safeKey = validateTicketKey(expectedTicketKey)
-  if (!rel || !safeKey) return false
-  return (
-    rel.toLowerCase() === `.orca/task-bridge/proposed-ac-${safeKey.toLowerCase()}.json` ||
-    rel.toLowerCase().endsWith(`/.orca/task-bridge/proposed-ac-${safeKey.toLowerCase()}.json`)
+  if (!safeKey) return false
+  return isTaskBridgeArtifactWrite(
+    extractWriteTargetPath(input),
+    `proposed-ac-${safeKey.toLowerCase()}.json`,
+    workspaceRoot
   )
 }
-

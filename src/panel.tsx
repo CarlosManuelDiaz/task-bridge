@@ -33,6 +33,7 @@ import {
   buildAgentPrompt,
   buildBranchName,
   type LiveAgentState,
+  type RepoGuidelines,
   type TaskBridgeState,
   type TaskItem,
   type TaskKind,
@@ -115,6 +116,10 @@ const commentFeedbackInput = atom<string>('')
 const hydratedRepoKey = atom<string | null>(null)
 const prUrlInput = atom<string>('')
 const completionCommentInput = atom<string>('')
+// Archive Worktree is destructive (`orca worktree rm`): the first press arms it, the second confirms
+const pendingArchiveTaskId = atom<string | null>(null)
+// Actions currently in flight (e.g. `sync`, `verifyAc:jira:ENG-1`): each runs once at a time and its buttons are disabled
+const pendingActions = atom<string[]>([])
 
 // Manual ticket form & unlinked worktree registration controls
 const newProvider = atom<TaskProvider>('linear')
@@ -249,7 +254,7 @@ function applyIncomingState(next: TaskBridgeState): void {
   const currentSelected = read(selectedTaskId)
   if (!currentSelected || !next.tasks.some((t) => t.id === currentSelected)) {
     const fallback = next.activeTaskId ?? next.tasks[0]?.id ?? null
-    set(selectedTaskId, fallback)
+    selectTaskId(fallback)
   }
   const currentProj = read(projectFilter)
   if (currentProj !== 'all' && !next.tasks.some((t) => t.project === currentProj)) {
@@ -309,31 +314,39 @@ function priorityTone(priority: TaskPriority): Tone {
   return 'neutral'
 }
 
-async function handleSync(nextScope?: TaskScopeFilter): Promise<void> {
-  const filter = read(providerFilter)
-  const provider =
-    filter === 'linear' || filter === 'jira' || filter === 'notion' ? filter : 'all'
-  const scope = nextScope ?? read(bridgeState).scope
-  const res = await plugin.request('tasks.sync', { provider, scope })
-  applyIncomingState(res.state)
-  set(statusMessage, { text: res.message, tone: 'accent' })
+async function handleSyncNow(nextScope?: TaskScopeFilter): Promise<void> {
+  try {
+    const filter = read(providerFilter)
+    const provider =
+      filter === 'linear' || filter === 'jira' || filter === 'notion' ? filter : 'all'
+    const scope = nextScope ?? read(bridgeState).scope
+    const res = await plugin.request('tasks.sync', { provider, scope })
+    applyIncomingState(res.state)
+    set(statusMessage, { text: res.message, tone: 'accent' })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
 }
 
 async function handleAssignTaskRepo(taskId: string, repoValue: string): Promise<void> {
-  const res = await plugin.request('tasks.assignRepo', {
-    taskId,
-    repoId: repoValue === '__auto__' ? null : repoValue
-  })
-  set(hydratedRepoKey, null)
-  applyIncomingState(res.state)
-  set(statusMessage, { text: res.summary, tone: 'accent' })
+  try {
+    const res = await plugin.request('tasks.assignRepo', {
+      taskId,
+      repoId: repoValue === '__auto__' ? null : repoValue
+    })
+    set(hydratedRepoKey, null)
+    applyIncomingState(res.state)
+    set(statusMessage, { text: res.summary, tone: 'accent' })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
 }
 
 function formatActionError(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
-async function handleQuickDispatch(task: TaskItem): Promise<void> {
+async function handleQuickDispatchNow(task: TaskItem): Promise<void> {
   const state = read(bridgeState)
   const targetRepo = resolveTaskRepoInfo(state, task)
   try {
@@ -344,7 +357,7 @@ async function handleQuickDispatch(task: TaskItem): Promise<void> {
       createWorktree: true
     })
     applyIncomingState(res.state)
-    set(selectedTaskId, task.id)
+    selectTaskId(task.id)
     set(statusMessage, {
       text: res.summary,
       tone: res.launchWarning ? 'warning' : 'success'
@@ -355,14 +368,18 @@ async function handleQuickDispatch(task: TaskItem): Promise<void> {
 }
 
 async function handleOpenWorkspace(taskId: string): Promise<void> {
-  const res = await plugin.request('tasks.openWorkspace', { taskId })
-  set(statusMessage, {
-    text: res.summary,
-    tone: res.opened ? 'accent' : 'warning'
-  })
+  try {
+    const res = await plugin.request('tasks.openWorkspace', { taskId })
+    set(statusMessage, {
+      text: res.summary,
+      tone: res.opened ? 'accent' : 'warning'
+    })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
 }
 
-async function handleWorkbenchDispatch(): Promise<void> {
+async function handleWorkbenchDispatchNow(): Promise<void> {
   const state = read(bridgeState)
   const currentId = read(selectedTaskId) ?? state.tasks[0]?.id
   if (!currentId) return
@@ -394,132 +411,181 @@ async function handleWorkbenchDispatch(): Promise<void> {
   }
 }
 
-async function handleApprovePlan(taskId: string): Promise<void> {
-  const res = await plugin.request('tasks.approvePlan', { taskId })
-  applyIncomingState(res.state)
-  set(statusMessage, { text: res.summary, tone: 'success' })
+async function handleApprovePlanNow(taskId: string): Promise<void> {
+  try {
+    const res = await plugin.request('tasks.approvePlan', { taskId })
+    applyIncomingState(res.state)
+    set(statusMessage, { text: res.summary, tone: 'success' })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
 }
 
 async function handleSaveRepoProfile(): Promise<void> {
-  const state = read(bridgeState)
-  const currentTaskId = read(selectedTaskId) ?? state.activeTaskId ?? state.tasks[0]?.id ?? null
-  const currentTask = state.tasks.find((t) => t.id === currentTaskId) ?? null
-  const { repoId, repoName } = getWorkbenchTargetRepoContext(state, currentTask)
-  if (!repoId) {
+  try {
+    const state = read(bridgeState)
+    const currentTaskId = read(selectedTaskId) ?? state.activeTaskId ?? state.tasks[0]?.id ?? null
+    const currentTask = state.tasks.find((t) => t.id === currentTaskId) ?? null
+    const { repoId, repoName } = getWorkbenchTargetRepoContext(state, currentTask)
+    if (!repoId) {
+      set(statusMessage, {
+        text: 'Select a Target Repository or focus a Git repository workspace in Orca to save a repo profile.',
+        tone: 'warning'
+      })
+      return
+    }
+
+    const copyFiles = read(profileCopyFilesInput)
+      .split(/[\n,]/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+    const ticketPrefixes = read(profileTicketPrefixesInput)
+      .split(/[\n,]/)
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean)
+
+    const res = await plugin.request('tasks.saveRepoProfile', {
+      repoId,
+      profile: {
+        repoName,
+        defaultAgent: read(selectedAgent),
+        branchTemplate: read(profileBranchTemplateInput).trim(),
+        featurePrefix: read(profileFeaturePrefixInput).trim(),
+        bugPrefix: read(profileBugPrefixInput).trim(),
+        chorePrefix: read(profileChorePrefixInput).trim(),
+        requirePlanApproval: read(requirePlanApprovalToggle),
+        enforcePlanLock: read(enforcePlanLockToggle),
+        worktreeCopyFiles: copyFiles,
+        ticketPrefixes
+      }
+    })
+    set(hydratedRepoKey, null)
+    applyIncomingState(res.state)
+    set(statusMessage, { text: res.summary, tone: 'success' })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
+}
+
+// Workbench draft fields (PR URL, completion comment, feedback text) belong to the ticket selected in
+// Workbench. Actions fired from Queue/Fleet for another ticket must never send those drafts.
+function isWorkbenchDraftOwner(taskId: string): boolean {
+  return read(selectedTaskId) === taskId
+}
+
+async function handleSendCommentFeedbackNow(taskId: string): Promise<void> {
+  try {
+    const ownsDraft = isWorkbenchDraftOwner(taskId)
+    const customInstruction = ownsDraft ? read(commentFeedbackInput).trim() : ''
+    const res = await plugin.request('tasks.sendCommentFeedback', {
+      taskId,
+      ...(customInstruction ? { customInstruction } : {})
+    })
+    if (ownsDraft) set(commentFeedbackInput, '')
+    applyIncomingState(res.state)
+    set(statusMessage, { text: res.summary, tone: 'success' })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
+}
+
+async function handleSendPrFeedbackNow(taskId: string): Promise<void> {
+  try {
+    const res = await plugin.request('tasks.sendPrFeedback', { taskId })
+    applyIncomingState(res.state)
+    set(statusMessage, { text: res.summary, tone: 'success' })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
+}
+
+async function handleApproveRepoSetup(repoId: string, configHash: string): Promise<void> {
+  try {
+    const res = await plugin.request('tasks.approveRepoSetup', { repoId, configHash })
+    applyIncomingState(res.state)
+    set(statusMessage, { text: res.summary, tone: 'success' })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
+}
+
+async function handleApplyDetectedGuidelines(): Promise<void> {
+  try {
+    const state = read(bridgeState)
+    const currentTaskId = read(selectedTaskId) ?? state.activeTaskId ?? state.tasks[0]?.id ?? null
+    const currentTask = state.tasks.find((t) => t.id === currentTaskId) ?? null
+    const { repoId, guidelines: g } = getWorkbenchTargetRepoContext(state, currentTask)
+    if (!g) return
+
+    if (g.detectedBranchHint) {
+      const hint = g.detectedBranchHint
+      if (hint.startsWith('feature/')) {
+        set(profileFeaturePrefixInput, 'feature')
+      } else if (hint.startsWith('feat/')) {
+        set(profileFeaturePrefixInput, 'feat')
+      }
+      set(
+        profileBranchTemplateInput,
+        hint.replace(/^feature\//, '{prefix}/').replace(/^feat\//, '{prefix}/') ||
+          '{prefix}/{key}-{slug}'
+      )
+    }
+    if (g.detectedPlanRequired) {
+      set(requirePlanApprovalToggle, true)
+    }
+    if (repoId) {
+      await handleSaveRepoProfile()
+    } else {
+      set(statusMessage, {
+        text: 'Applied detected repo guidelines to Workbench controls.',
+        tone: 'accent'
+      })
+    }
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
+}
+
+async function handleCleanupWorktreeNow(taskId: string, deleteBranch = false): Promise<void> {
+  if (read(pendingArchiveTaskId) !== taskId) {
+    const key = read(bridgeState).tasks.find((t) => t.id === taskId)?.key ?? taskId
+    set(pendingArchiveTaskId, taskId)
     set(statusMessage, {
-      text: 'Select a Target Repository or focus a Git repository workspace in Orca to save a repo profile.',
+      text: `Archive will remove the worktree folder for [${key}] (uncommitted changes there are lost). Press Archive Worktree again to confirm.`,
       tone: 'warning'
     })
     return
   }
-
-  const copyFiles = read(profileCopyFilesInput)
-    .split(/[\n,]/)
-    .map((s) => s.trim())
-    .filter(Boolean)
-  const ticketPrefixes = read(profileTicketPrefixesInput)
-    .split(/[\n,]/)
-    .map((s) => s.trim().toUpperCase())
-    .filter(Boolean)
-
-  const res = await plugin.request('tasks.saveRepoProfile', {
-    repoId,
-    profile: {
-      repoName,
-      defaultAgent: read(selectedAgent),
-      branchTemplate: read(profileBranchTemplateInput).trim(),
-      featurePrefix: read(profileFeaturePrefixInput).trim(),
-      bugPrefix: read(profileBugPrefixInput).trim(),
-      chorePrefix: read(profileChorePrefixInput).trim(),
-      requirePlanApproval: read(requirePlanApprovalToggle),
-      enforcePlanLock: read(enforcePlanLockToggle),
-      worktreeCopyFiles: copyFiles,
-      ticketPrefixes
-    }
-  })
-  set(hydratedRepoKey, null)
-  applyIncomingState(res.state)
-  set(statusMessage, { text: res.summary, tone: 'success' })
-}
-
-async function handleSendCommentFeedback(taskId: string): Promise<void> {
-  const customInstruction = read(commentFeedbackInput).trim()
-  const res = await plugin.request('tasks.sendCommentFeedback', {
-    taskId,
-    ...(customInstruction ? { customInstruction } : {})
-  })
-  set(commentFeedbackInput, '')
-  applyIncomingState(res.state)
-  set(statusMessage, { text: res.summary, tone: 'success' })
-}
-
-async function handleSendPrFeedback(taskId: string): Promise<void> {
-  const res = await plugin.request('tasks.sendPrFeedback', { taskId })
-  applyIncomingState(res.state)
-  set(statusMessage, { text: res.summary, tone: 'success' })
-}
-
-async function handleApproveRepoSetup(repoId: string, configHash: string): Promise<void> {
-  const res = await plugin.request('tasks.approveRepoSetup', { repoId, configHash })
-  applyIncomingState(res.state)
-  set(statusMessage, { text: res.summary, tone: 'success' })
-}
-
-async function handleApplyDetectedGuidelines(): Promise<void> {
-  const state = read(bridgeState)
-  const currentTaskId = read(selectedTaskId) ?? state.activeTaskId ?? state.tasks[0]?.id ?? null
-  const currentTask = state.tasks.find((t) => t.id === currentTaskId) ?? null
-  const { repoId, guidelines: g } = getWorkbenchTargetRepoContext(state, currentTask)
-  if (!g) return
-
-  if (g.detectedBranchHint) {
-    const hint = g.detectedBranchHint
-    if (hint.startsWith('feature/')) {
-      set(profileFeaturePrefixInput, 'feature')
-    } else if (hint.startsWith('feat/')) {
-      set(profileFeaturePrefixInput, 'feat')
-    }
-    set(
-      profileBranchTemplateInput,
-      hint.replace(/^feature\//, '{prefix}/').replace(/^feat\//, '{prefix}/') ||
-        '{prefix}/{key}-{slug}'
-    )
-  }
-  if (g.detectedPlanRequired) {
-    set(requirePlanApprovalToggle, true)
-  }
-  if (repoId) {
-    await handleSaveRepoProfile()
-  } else {
+  set(pendingArchiveTaskId, null)
+  try {
+    const res = await plugin.request('tasks.cleanupWorktree', { taskId, deleteBranch })
+    applyIncomingState(res.state)
     set(statusMessage, {
-      text: 'Applied detected repo guidelines to Workbench controls.',
-      tone: 'accent'
+      text: res.summary,
+      tone: res.removed ? 'success' : 'warning'
     })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
   }
-}
-
-async function handleCleanupWorktree(taskId: string, deleteBranch = false): Promise<void> {
-  const res = await plugin.request('tasks.cleanupWorktree', { taskId, deleteBranch })
-  applyIncomingState(res.state)
-  set(statusMessage, {
-    text: res.summary,
-    tone: res.removed ? 'success' : 'warning'
-  })
 }
 
 async function handleDismissFleet(taskId?: string, clearFinished = false): Promise<void> {
-  const res = await plugin.request('tasks.dismissFleet', {
-    ...(taskId ? { taskId } : {}),
-    ...(clearFinished ? { clearFinished: true } : {})
-  })
-  applyIncomingState(res.state)
-  set(statusMessage, {
-    text: res.summary,
-    tone: res.removedCount > 0 ? 'success' : 'accent'
-  })
+  try {
+    const res = await plugin.request('tasks.dismissFleet', {
+      ...(taskId ? { taskId } : {}),
+      ...(clearFinished ? { clearFinished: true } : {})
+    })
+    applyIncomingState(res.state)
+    set(statusMessage, {
+      text: res.summary,
+      tone: res.removedCount > 0 ? 'success' : 'accent'
+    })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
 }
 
-async function handleDispatchChildren(parentTaskId: string): Promise<void> {
+async function handleDispatchChildrenNow(parentTaskId: string): Promise<void> {
   try {
     const state = read(bridgeState)
     const parentTask = state.tasks.find((t) => t.id === parentTaskId)
@@ -540,32 +606,42 @@ async function handleDispatchChildren(parentTaskId: string): Promise<void> {
   }
 }
 
-async function handleDetectPr(taskId: string): Promise<void> {
-  const res = await plugin.request('tasks.detectPr', { taskId })
-  applyIncomingState(res.state)
-  if (res.prUrl) {
-    set(prUrlInput, res.prUrl)
+async function handleDetectPrNow(taskId: string): Promise<void> {
+  try {
+    const res = await plugin.request('tasks.detectPr', { taskId })
+    applyIncomingState(res.state)
+    if (isWorkbenchDraftOwner(taskId)) {
+      if (res.prUrl) {
+        set(prUrlInput, res.prUrl)
+      }
+      if (res.commitSummary) {
+        set(completionCommentInput, res.commitSummary)
+      }
+    }
+    set(statusMessage, {
+      text: res.summary,
+      tone: res.prUrl ? 'success' : 'accent'
+    })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
   }
-  if (res.commitSummary) {
-    set(completionCommentInput, res.commitSummary)
-  }
-  set(statusMessage, {
-    text: res.summary,
-    tone: res.prUrl ? 'success' : 'accent'
-  })
 }
 
-async function handleVerifyAc(taskId: string): Promise<void> {
-  const reviewerChoice = read(selectedAcReviewerAgent)
-  const res = await plugin.request('tasks.verifyAcceptanceCriteria', {
-    taskId,
-    ...(reviewerChoice && reviewerChoice !== '__auto__' ? { reviewerAgent: reviewerChoice } : {})
-  })
-  applyIncomingState(res.state)
-  set(statusMessage, { text: res.summary, tone: 'success' })
+async function handleVerifyAcNow(taskId: string): Promise<void> {
+  try {
+    const reviewerChoice = read(selectedAcReviewerAgent)
+    const res = await plugin.request('tasks.verifyAcceptanceCriteria', {
+      taskId,
+      ...(reviewerChoice && reviewerChoice !== '__auto__' ? { reviewerAgent: reviewerChoice } : {})
+    })
+    applyIncomingState(res.state)
+    set(statusMessage, { text: res.summary, tone: 'success' })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
 }
 
-async function handleProposeAc(taskId: string): Promise<void> {
+async function handleProposeAcNow(taskId: string): Promise<void> {
   try {
     const reviewerChoice = read(selectedAcReviewerAgent)
     const res = await plugin.request('tasks.proposeAcceptanceCriteria', {
@@ -579,7 +655,7 @@ async function handleProposeAc(taskId: string): Promise<void> {
   }
 }
 
-async function handleAcceptProposedAc(taskId: string): Promise<void> {
+async function handleAcceptProposedAcNow(taskId: string): Promise<void> {
   try {
     const res = await plugin.request('tasks.acceptProposedAc', { taskId })
     applyIncomingState(res.state)
@@ -589,7 +665,7 @@ async function handleAcceptProposedAc(taskId: string): Promise<void> {
   }
 }
 
-async function handleAssignToMe(taskId: string): Promise<void> {
+async function handleAssignToMeNow(taskId: string): Promise<void> {
   try {
     const res = await plugin.request('tasks.assignToMe', { taskId })
     applyIncomingState(res.state)
@@ -620,7 +696,7 @@ async function handleDiscoverJiraMetadata(projectKey?: string): Promise<void> {
   }
 }
 
-async function handleCreateFromWorkspace(): Promise<void> {
+async function handleCreateFromWorkspaceNow(): Promise<void> {
   const state = read(bridgeState)
   const projectKey = (read(createWsProjectInput).trim() || state.defaultJiraProject || '').toUpperCase()
   const issueTypeId = read(createWsTypeInput).trim() || state.defaultJiraIssueType || ''
@@ -640,80 +716,110 @@ async function handleCreateFromWorkspace(): Promise<void> {
     })
     set(createWsTitleInput, '')
     applyIncomingState(res.state)
-    set(selectedTaskId, res.created.id)
+    selectTaskId(res.created.id)
     set(statusMessage, { text: res.summary, tone: 'success' })
   } catch (err) {
     set(statusMessage, { text: formatActionError(err), tone: 'warning' })
   }
 }
 
-async function handleTransition(
+async function handleTransitionNow(
   taskId: string,
   targetCategory: TaskStatusCategory
 ): Promise<void> {
-  const res = await plugin.request('tasks.transition', {
-    taskId,
-    targetCategory,
-    prUrl: read(prUrlInput),
-    comment: read(completionCommentInput)
-  })
-  applyIncomingState(res.state)
-  set(statusMessage, {
-    text: res.summary,
-    tone: res.providerSynced ? 'success' : 'warning'
-  })
+  try {
+    const ownsDraft = isWorkbenchDraftOwner(taskId)
+    const res = await plugin.request('tasks.transition', {
+      taskId,
+      targetCategory,
+      ...(ownsDraft ? { prUrl: read(prUrlInput), comment: read(completionCommentInput) } : {})
+    })
+    applyIncomingState(res.state)
+    set(statusMessage, {
+      text: res.summary,
+      tone: res.providerSynced ? 'success' : 'warning'
+    })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
 }
 
 async function handleAddManual(): Promise<void> {
-  const key = read(newKey).trim()
-  const title = read(newTitle).trim()
-  if (!key || !title) {
+  try {
+    const key = read(newKey).trim()
+    const title = read(newTitle).trim()
+    if (!key || !title) {
+      set(statusMessage, {
+        text: 'Please provide both a Ticket Key and a Ticket Title.',
+        tone: 'warning'
+      })
+      return
+    }
+
+    const res = await plugin.request('tasks.addManual', {
+      provider: read(newProvider),
+      kind: read(newKind),
+      priority: read(newPriority),
+      key,
+      title,
+      description: read(newDescription),
+      acceptanceCriteria: read(newCriteria)
+    })
+    applyIncomingState(res.state)
+    selectTaskId(res.created.id)
+    set(newKey, '')
+    set(newTitle, '')
+    set(newDescription, '')
+    set(newCriteria, '')
+    set(activeTab, 'queue')
     set(statusMessage, {
-      text: 'Please provide both a Ticket Key and a Ticket Title.',
+      text: `Added [${res.created.key}] ${res.created.title} to queue.`,
+      tone: 'success'
+    })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
+}
+
+async function handleSaveNotionToken(clear = false): Promise<void> {
+  // An empty field used to silently delete the saved token: clearing is now its own explicit button
+  const token = clear ? '' : read(notionTokenInput).trim()
+  if (!clear && !token) {
+    set(statusMessage, {
+      text: 'Paste a Notion integration token first (use Clear Notion Token to remove the saved one).',
       tone: 'warning'
     })
     return
   }
-
-  const res = await plugin.request('tasks.addManual', {
-    provider: read(newProvider),
-    kind: read(newKind),
-    priority: read(newPriority),
-    key,
-    title,
-    description: read(newDescription),
-    acceptanceCriteria: read(newCriteria)
-  })
-  applyIncomingState(res.state)
-  set(selectedTaskId, res.created.id)
-  set(newKey, '')
-  set(newTitle, '')
-  set(newDescription, '')
-  set(newCriteria, '')
-  set(activeTab, 'queue')
-  set(statusMessage, {
-    text: `Added [${res.created.key}] ${res.created.title} to queue.`,
-    tone: 'success'
-  })
+  try {
+    const res = await plugin.request('tasks.saveNotionToken', { token })
+    applyIncomingState(res.state)
+    set(notionTokenInput, '')
+    set(statusMessage, {
+      text: res.configured
+        ? 'Notion API token saved in encrypted storage.'
+        : 'Notion API token cleared.',
+      tone: res.configured ? 'success' : 'neutral'
+    })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
 }
 
-async function handleSaveNotionToken(): Promise<void> {
-  const res = await plugin.request('tasks.saveNotionToken', {
-    token: read(notionTokenInput)
-  })
-  applyIncomingState(res.state)
-  set(notionTokenInput, '')
-  set(statusMessage, {
-    text: res.configured
-      ? 'Notion API token saved in encrypted storage.'
-      : 'Notion API token cleared.',
-    tone: res.configured ? 'success' : 'neutral'
-  })
+// Every change of the selected ticket goes through here: Workbench drafts belong to one ticket
+// and must never carry over to the next selection.
+function selectTaskId(taskId: string | null): void {
+  if (read(selectedTaskId) !== taskId) {
+    set(prUrlInput, '')
+    set(completionCommentInput, '')
+    set(commentFeedbackInput, '')
+  }
+  set(selectedTaskId, taskId)
 }
 
 function selectTaskForWorkbench(taskId: string): void {
   const state = read(bridgeState)
-  set(selectedTaskId, taskId)
+  selectTaskId(taskId)
   set(branchOverride, '')
   set(childSearchQuery, '')
   set(childStatusFilter, 'all')
@@ -729,15 +835,117 @@ function openTaskInWorkbench(taskId: string): void {
   set(activeTab, 'workbench')
 }
 
+// ---- In-flight action guard ------------------------------------------------------------------------
+// Buttons used to fire twice (two worktrees, two Jira comments, concurrent syncs). Every action below runs
+// at most once at a time per key, and the buttons bound to it are disabled while it runs.
+
+function actionKey(action: string, taskId: string): string {
+  return `${action}:${taskId}`
+}
+
+function isPending(key: string): boolean {
+  return read(pendingActions).includes(key)
+}
+
+async function runExclusive(key: string, action: () => Promise<void>): Promise<void> {
+  if (isPending(key)) return
+  set(pendingActions, [...read(pendingActions), key])
+  try {
+    await action()
+  } finally {
+    set(
+      pendingActions,
+      read(pendingActions).filter((k) => k !== key)
+    )
+  }
+}
+
+function handleSync(nextScope?: TaskScopeFilter): Promise<void> {
+  return runExclusive('sync', () => handleSyncNow(nextScope))
+}
+
+function handleQuickDispatch(task: TaskItem): Promise<void> {
+  return runExclusive(`dispatch:${task.id}`, () => handleQuickDispatchNow(task))
+}
+
+function handleWorkbenchDispatch(): Promise<void> {
+  return runExclusive('dispatch:workbench', () => handleWorkbenchDispatchNow())
+}
+
+function handleCreateFromWorkspace(): Promise<void> {
+  return runExclusive('createTicket', () => handleCreateFromWorkspaceNow())
+}
+
+function handleApprovePlan(taskId: string): Promise<void> {
+  return runExclusive(actionKey('approvePlan', taskId), () => handleApprovePlanNow(taskId))
+}
+
+function handleSendCommentFeedback(taskId: string): Promise<void> {
+  return runExclusive(actionKey('sendCommentFeedback', taskId), () =>
+    handleSendCommentFeedbackNow(taskId)
+  )
+}
+
+function handleSendPrFeedback(taskId: string): Promise<void> {
+  return runExclusive(actionKey('sendPrFeedback', taskId), () => handleSendPrFeedbackNow(taskId))
+}
+
+function handleCleanupWorktree(taskId: string, deleteBranch = false): Promise<void> {
+  return runExclusive(actionKey('cleanupWorktree', taskId), () =>
+    handleCleanupWorktreeNow(taskId, deleteBranch)
+  )
+}
+
+function handleDispatchChildren(parentTaskId: string): Promise<void> {
+  return runExclusive(actionKey('dispatchChildren', parentTaskId), () =>
+    handleDispatchChildrenNow(parentTaskId)
+  )
+}
+
+function handleDetectPr(taskId: string): Promise<void> {
+  return runExclusive(actionKey('detectPr', taskId), () => handleDetectPrNow(taskId))
+}
+
+function handleVerifyAc(taskId: string): Promise<void> {
+  return runExclusive(actionKey('verifyAc', taskId), () => handleVerifyAcNow(taskId))
+}
+
+function handleProposeAc(taskId: string): Promise<void> {
+  return runExclusive(actionKey('proposeAc', taskId), () => handleProposeAcNow(taskId))
+}
+
+function handleAcceptProposedAc(taskId: string): Promise<void> {
+  return runExclusive(actionKey('acceptProposedAc', taskId), () => handleAcceptProposedAcNow(taskId))
+}
+
+function handleAssignToMe(taskId: string): Promise<void> {
+  return runExclusive(actionKey('assignToMe', taskId), () => handleAssignToMeNow(taskId))
+}
+
+function handleTransition(taskId: string, targetCategory: TaskStatusCategory): Promise<void> {
+  // One key per ticket: "In Review" and "Done" on the same ticket must not race each other
+  return runExclusive(actionKey('transition', taskId), () => handleTransitionNow(taskId, targetCategory))
+}
+
 export function setup(ctx: PanelContext): void {
   ctx.subscriptions.push(
     plugin.on('tasks.stateChanged', (next) => {
       applyIncomingState(next)
     })
   )
-  void plugin.request('tasks.getState').then((initial) => {
-    applyIncomingState(initial)
-  })
+  void plugin
+    .request('tasks.getState')
+    .then((initial) => {
+      applyIncomingState(initial)
+    })
+    .catch((err: unknown) => {
+      // Never leave the panel stuck on "Loading": show the default view and say why
+      set(loaded, true)
+      set(statusMessage, {
+        text: `Task Bridge could not load its state: ${formatActionError(err)}. Try Sync.`,
+        tone: 'warning'
+      })
+    })
 }
 
 export default function Panel() {
@@ -850,7 +1058,7 @@ export default function Panel() {
           {state.autoSyncMinutes > 0 && !state.usingDemoData && fleetItems.length > 0 ? (
             <Badge tone="neutral">{`Auto ${state.autoSyncMinutes}m`}</Badge>
           ) : null}
-          <Button size="xs" variant="outline" icon="refresh" onPress={() => handleSync()}>
+          <Button size="xs" variant="outline" icon="refresh" disabled={isPending('sync')} onPress={() => handleSync()}>
             Sync
           </Button>
         </Row>
@@ -910,7 +1118,7 @@ export default function Panel() {
                 variant="solid"
                 tone="accent"
                 icon="add"
-                onPress={handleCreateFromWorkspace}
+                disabled={isPending('createTicket')} onPress={() => handleCreateFromWorkspace()}
               >
                 Create Ticket
               </Button>
@@ -966,7 +1174,7 @@ export default function Panel() {
                   size="xs"
                   variant={state.scope === s.id ? 'solid' : 'ghost'}
                   tone={state.scope === s.id ? 'accent' : 'neutral'}
-                  onPress={() => handleSync(s.id)}
+                  disabled={isPending('sync')} onPress={() => handleSync(s.id)}
                 >
                   {s.label}
                 </Button>
@@ -1068,7 +1276,7 @@ export default function Panel() {
                 ) : null}
                 {state.syncTruncated ? (
                   <Badge tone="neutral">
-                    {`Showing ${filteredTasks.length} (limit reached)`}
+                    {`Showing ${state.syncTotalCount ?? state.tasks.length} (limit reached)`}
                   </Badge>
                 ) : null}
               </Row>
@@ -1103,7 +1311,7 @@ export default function Panel() {
                         variant="outline"
                         tone="accent"
                         icon="check"
-                        onPress={() => handleAssignToMe(uTask.id)}
+                        disabled={isPending(actionKey('assignToMe', uTask.id))} onPress={() => handleAssignToMe(uTask.id)}
                       >
                         {`Assign to Me ${uTask.key}`}
                       </Button>
@@ -1223,7 +1431,7 @@ export default function Panel() {
                               variant="solid"
                               tone="accent"
                               icon="play"
-                              onPress={() => handleQuickDispatch(task)}
+                              disabled={isPending(`dispatch:${task.id}`)} onPress={() => handleQuickDispatch(task)}
                             >
                               {`Start ${task.key}`}
                             </Button>
@@ -1233,7 +1441,7 @@ export default function Panel() {
                                 variant="solid"
                                 tone="warning"
                                 icon="check"
-                                onPress={() => handleApprovePlan(task.id)}
+                                disabled={isPending(actionKey('approvePlan', task.id))} onPress={() => handleApprovePlan(task.id)}
                               >
                                 {`Approve Plan ${task.key}`}
                               </Button>
@@ -1262,7 +1470,7 @@ export default function Panel() {
                                 size="xs"
                                 variant="ghost"
                                 icon="check"
-                                onPress={() => handleTransition(task.id, 'in_review')}
+                                disabled={isPending(actionKey('transition', task.id))} onPress={() => handleTransition(task.id, 'in_review')}
                               >
                                 {`Review ${task.key}`}
                               </Button>
@@ -1366,7 +1574,7 @@ export default function Panel() {
                           variant="solid"
                           tone="warning"
                           icon="check"
-                          onPress={() => handleApprovePlan(item.taskId)}
+                          disabled={isPending(actionKey('approvePlan', item.taskId))} onPress={() => handleApprovePlan(item.taskId)}
                         >
                           {`Approve Plan ${item.key}`}
                         </Button>
@@ -1377,7 +1585,7 @@ export default function Panel() {
                           variant="outline"
                           tone="warning"
                           icon="zap"
-                          onPress={() => handleSendCommentFeedback(item.taskId)}
+                          disabled={isPending(actionKey('sendCommentFeedback', item.taskId))} onPress={() => handleSendCommentFeedback(item.taskId)}
                         >
                           {`Send Comments ${item.key}`}
                         </Button>
@@ -1388,7 +1596,7 @@ export default function Panel() {
                           variant="outline"
                           tone="warning"
                           icon="zap"
-                          onPress={() => handleSendPrFeedback(item.taskId)}
+                          disabled={isPending(actionKey('sendPrFeedback', item.taskId))} onPress={() => handleSendPrFeedback(item.taskId)}
                         >
                           {`Send PR Feedback ${item.key}`}
                         </Button>
@@ -1406,7 +1614,7 @@ export default function Panel() {
                         size="xs"
                         variant="outline"
                         icon="search"
-                        onPress={() => handleDetectPr(item.taskId)}
+                        disabled={isPending(actionKey('detectPr', item.taskId))} onPress={() => handleDetectPr(item.taskId)}
                       >
                         {`Detect PR ${item.key}`}
                       </Button>
@@ -1414,7 +1622,7 @@ export default function Panel() {
                         size="xs"
                         variant="outline"
                         icon="bot"
-                        onPress={() => handleVerifyAc(item.taskId)}
+                        disabled={isPending(actionKey('verifyAc', item.taskId))} onPress={() => handleVerifyAc(item.taskId)}
                       >
                         {`Verify AC ${item.key}`}
                       </Button>
@@ -1422,7 +1630,7 @@ export default function Panel() {
                         size="xs"
                         variant="ghost"
                         icon="check"
-                        onPress={() => handleTransition(item.taskId, 'in_review')}
+                        disabled={isPending(actionKey('transition', item.taskId))} onPress={() => handleTransition(item.taskId, 'in_review')}
                       >
                         {`In Review ${item.key}`}
                       </Button>
@@ -1430,18 +1638,20 @@ export default function Panel() {
                         size="xs"
                         variant="ghost"
                         icon="check"
-                        onPress={() => handleTransition(item.taskId, 'done')}
+                        disabled={isPending(actionKey('transition', item.taskId))} onPress={() => handleTransition(item.taskId, 'done')}
                       >
                         {`Done ${item.key}`}
                       </Button>
-                      {item.workspaceExists &&
+                      {item.canArchive &&
                       (item.statusCategory === 'done' || item.statusCategory === 'in_review') ? (
                         <Button
                           size="xs"
                           variant="ghost"
-                          onPress={() => handleCleanupWorktree(item.taskId)}
+                          disabled={isPending(actionKey('cleanupWorktree', item.taskId))} onPress={() => handleCleanupWorktree(item.taskId)}
                         >
-                          {`Archive Worktree ${item.key}`}
+                          {read(pendingArchiveTaskId) === item.taskId
+                            ? `Confirm Archive ${item.key}`
+                            : `Archive Worktree ${item.key}`}
                         </Button>
                       ) : null}
                       <Button
@@ -1612,7 +1822,7 @@ export default function Panel() {
                           variant="outline"
                           tone="warning"
                           icon="bot"
-                          onPress={() => handleProposeAc(selectedTask.id)}
+                          disabled={isPending(actionKey('proposeAc', selectedTask.id))} onPress={() => handleProposeAc(selectedTask.id)}
                         >
                           Propose AC
                         </Button>
@@ -1636,7 +1846,7 @@ export default function Panel() {
                           variant="solid"
                           tone="accent"
                           icon="check"
-                          onPress={() => handleAcceptProposedAc(selectedTask.id)}
+                          disabled={isPending(actionKey('acceptProposedAc', selectedTask.id))} onPress={() => handleAcceptProposedAc(selectedTask.id)}
                         >
                           Accept Proposed AC
                         </Button>
@@ -1649,14 +1859,14 @@ export default function Panel() {
                       variant="solid"
                       tone="accent"
                       icon="rocket"
-                      onPress={handleWorkbenchDispatch}
+                      disabled={isPending('dispatch:workbench')} onPress={() => handleWorkbenchDispatch()}
                     >
                       Launch Worktree & Agent
                     </Button>
                     <Button
                       variant="outline"
                       icon="bot"
-                      onPress={() => handleProposeAc(selectedTask.id)}
+                      disabled={isPending(actionKey('proposeAc', selectedTask.id))} onPress={() => handleProposeAc(selectedTask.id)}
                     >
                       Propose AC
                     </Button>
@@ -1665,7 +1875,7 @@ export default function Panel() {
                         variant="solid"
                         tone="warning"
                         icon="check"
-                        onPress={() => handleApprovePlan(selectedTask.id)}
+                        disabled={isPending(actionKey('approvePlan', selectedTask.id))} onPress={() => handleApprovePlan(selectedTask.id)}
                       >
                         Approve Plan & Unlock Edits
                       </Button>
@@ -1870,7 +2080,7 @@ export default function Panel() {
                         variant="outline"
                         tone="accent"
                         icon="zap"
-                        onPress={() => handleSendCommentFeedback(selectedTask.id)}
+                        disabled={isPending(actionKey('sendCommentFeedback', selectedTask.id))} onPress={() => handleSendCommentFeedback(selectedTask.id)}
                       >
                         Send Comments & Feedback to Agent
                       </Button>
@@ -1911,7 +2121,7 @@ export default function Panel() {
                         variant="outline"
                         tone="accent"
                         icon="zap"
-                        onPress={() => handleDispatchChildren(selectedTask.id)}
+                        disabled={isPending(actionKey('dispatchChildren', selectedTask.id))} onPress={() => handleDispatchChildren(selectedTask.id)}
                       >
                         {`Dispatch ${pendingChildrenCount} Pending Subtask(s) in Parallel`}
                       </Button>
@@ -1961,7 +2171,7 @@ export default function Panel() {
                       size="xs"
                       variant="outline"
                       icon="search"
-                      onPress={() => handleDetectPr(selectedTask.id)}
+                      disabled={isPending(actionKey('detectPr', selectedTask.id))} onPress={() => handleDetectPr(selectedTask.id)}
                     >
                       Auto-Detect PR & Commits
                     </Button>
@@ -1969,7 +2179,7 @@ export default function Panel() {
                       size="xs"
                       variant="outline"
                       icon="bot"
-                      onPress={() => handleVerifyAc(selectedTask.id)}
+                      disabled={isPending(actionKey('verifyAc', selectedTask.id))} onPress={() => handleVerifyAc(selectedTask.id)}
                     >
                       Verify Acceptance Criteria
                     </Button>
@@ -1994,7 +2204,7 @@ export default function Panel() {
                       variant="solid"
                       tone="success"
                       icon="check"
-                      onPress={() => handleTransition(selectedTask.id, 'in_review')}
+                      disabled={isPending(actionKey('transition', selectedTask.id))} onPress={() => handleTransition(selectedTask.id, 'in_review')}
                     >
                       Move to In Review
                     </Button>
@@ -2002,24 +2212,26 @@ export default function Panel() {
                       size="xs"
                       variant="outline"
                       icon="play"
-                      onPress={() => handleTransition(selectedTask.id, 'in_progress')}
+                      disabled={isPending(actionKey('transition', selectedTask.id))} onPress={() => handleTransition(selectedTask.id, 'in_progress')}
                     >
                       Move to In Progress
                     </Button>
                     <Button
                       size="xs"
                       variant="ghost"
-                      onPress={() => handleTransition(selectedTask.id, 'done')}
+                      disabled={isPending(actionKey('transition', selectedTask.id))} onPress={() => handleTransition(selectedTask.id, 'done')}
                     >
                       Mark Done
                     </Button>
-                    {selectedTask.linkedOrcaWorkspaceId ? (
+                    {selectedTask.linkedOrcaWorkspaceId && selectedTask.worktreeCreatedByPlugin !== false ? (
                       <Button
                         size="xs"
                         variant="outline"
-                        onPress={() => handleCleanupWorktree(selectedTask.id)}
+                        disabled={isPending(actionKey('cleanupWorktree', selectedTask.id))} onPress={() => handleCleanupWorktree(selectedTask.id)}
                       >
-                        Archive Worktree
+                        {read(pendingArchiveTaskId) === selectedTask.id
+                          ? 'Confirm Archive Worktree'
+                          : 'Archive Worktree'}
                       </Button>
                     ) : null}
                   </Row>
@@ -2143,14 +2355,21 @@ export default function Panel() {
                   onChange={(val) => set(notionTokenInput, val)}
                 />
 
-                <Button
-                  size="xs"
-                  variant="outline"
-                  icon="check"
-                  onPress={handleSaveNotionToken}
-                >
-                  Save Notion Token
-                </Button>
+                <Row gap="xs">
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    icon="check"
+                    onPress={() => handleSaveNotionToken()}
+                  >
+                    Save Notion Token
+                  </Button>
+                  {state.notionConfigured ? (
+                    <Button size="xs" variant="ghost" onPress={() => handleSaveNotionToken(true)}>
+                      Clear Notion Token
+                    </Button>
+                  ) : null}
+                </Row>
               </Stack>
             </Card>
 

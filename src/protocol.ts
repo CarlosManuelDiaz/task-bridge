@@ -64,12 +64,14 @@ export interface DiscoveredSkill {
   name: string
   description: string
   relativePath: string
-  rootDir: string
-  suggestedMoment?: 'dispatch' | 'bug' | 'verify' | 'feedback' | 'prFeedback'
+  /** Skill root folder relative to the repo (e.g. `.claude/skills`), used to tell native agent skills apart */
+  sourceDir: string
+  suggestedMoment?: 'general' | 'dispatch' | 'bug' | 'verify' | 'feedback' | 'prFeedback'
 }
 
 export interface RepoWorkflowMapping {
-  dispatch?: Record<string, string>
+  /** One skill for every dispatch, or one per ticket kind (`default`, `feature`, `bug`, `chore`) */
+  dispatch?: string | Partial<Record<'default' | 'feature' | 'bug' | 'chore', string>>
   verify?: string
   feedback?: string
   prFeedback?: string
@@ -87,6 +89,14 @@ export interface RepoConfigFile {
   planGate?: 'plugin' | 'skill' | 'both'
   subtaskBase?: 'default' | 'parent' | 'chain'
   skillDirs?: string[]
+  defaultAgent?: string
+  featurePrefix?: string
+  bugPrefix?: string
+  chorePrefix?: string
+  /** Can only turn the plan gate on: a repo file never relaxes the user's own setting */
+  requirePlanApproval?: boolean
+  /** Can only turn the plan lock on: a repo file never relaxes the user's own setting */
+  enforcePlanLock?: boolean
 }
 
 export interface RepoSetupApproval {
@@ -202,6 +212,8 @@ export interface TaskItem {
   agentStateStartedAt?: number
   detectedPrUrl?: string
   detectedCommitSummary?: string
+  /** false when the linked worktree existed before Task Bridge linked it (focused workspace, Create Ticket): never archive it */
+  worktreeCreatedByPlugin?: boolean
   acVerificationStatus?: AcVerificationStatus
   acVerificationSummary?: string
   acReviewerTerminalId?: string
@@ -244,6 +256,8 @@ export interface FleetItem {
   branch: string
   workspaceId: string | null
   workspaceExists: boolean
+  /** Archive Worktree is only offered for worktrees Task Bridge created itself */
+  canArchive: boolean
   agent: string
   agentState: LiveAgentState
   elapsedMinutes: number
@@ -542,7 +556,8 @@ function matchBranchTypeRule(
   task: { title: string; issueType?: string },
   rules?: readonly BranchTypeRule[]
 ): BranchTypeRule | undefined {
-  if (!Array.isArray(rules) || rules.length === 0) return undefined
+  // (`Array.isArray` would narrow a readonly array to `any[]`)
+  if (!rules || rules.length === 0) return undefined
   const typeLower = (task.issueType ?? '').trim().toLowerCase()
   const titleLower = (task.title ?? '').trim().toLowerCase()
 
@@ -559,7 +574,8 @@ function matchBranchTypeRule(
       const cleanKw = kw.trim().toLowerCase()
       if (!cleanKw) continue
       const escaped = cleanKw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      if (new RegExp(`\\b${escaped}\\b`, 'i').test(titleLower)) {
+      // Unicode-aware word boundaries: `\b` only knows ASCII, so `corrección` or `añadir` never matched
+      if (new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, 'iu').test(titleLower)) {
         return rule
       }
     }
@@ -581,6 +597,8 @@ export function buildAgentPrompt(
     enforcePlanLock?: boolean
     guidelines?: RepoGuidelines | null
     skillInstructions?: string[]
+    /** Review state name from `.task-bridge.json` `statusAliases.inReview`, used in the completion runbook */
+    reviewStatusName?: string
   }
 ): string {
   const safeKey = validateTicketKey(task.key) ?? 'TASK-1'
@@ -713,18 +731,22 @@ export function buildAgentPrompt(
         '   - Follow the repository PR template (`.github/pull_request_template.md`) when writing the PR description.'
       )
     }
+    // Workflows are often customised or localised ("En revisión", "Code Review"): use the repo's
+    // `statusAliases.inReview` when configured, and otherwise tell the agent to pick the real review state.
+    const reviewStatus = sanitizeUntrustedText(options.reviewStatusName ?? '', 60).replace(/["`]/g, '')
+    const reviewName = reviewStatus || 'In Review'
     if (task.provider === 'linear') {
       lines.push(
         `3. Attach the PR and move the Linear issue to Review:`,
         `   - \`orca linear attach --current --url <pr-url> --title "PR link" --json\``,
         `   - \`orca linear comment add --current --body-file - --json\``,
-        `   - \`orca linear status set --current --to "In Review" --json\``
+        `   - \`orca linear status set --current --to "${reviewName}" --json\`${reviewStatus ? '' : " (if the team's review state has another name, the error lists the available states: use that one)"}`
       )
     } else if (task.provider === 'jira') {
       lines.push(
         `3. Transition the Jira issue to Review and post the PR summary:`,
-        `   - \`orca jira status list ${safeKey} --json\``,
-        `   - \`orca jira status set ${safeKey} --to "In Review" --json\``,
+        `   - \`orca jira status list ${safeKey} --json\` and pick the transition whose target is the review state (${reviewStatus ? `"${reviewStatus}"` : 'for example In Review, Code Review or En revisión'})`,
+        `   - \`orca jira status set ${safeKey} --to-id <transition-id> --json\``,
         `   - \`orca jira comment add ${safeKey} --body "Implemented in <pr-url>." --json\``
       )
     } else {
@@ -740,7 +762,11 @@ export function buildAgentPrompt(
 /**
  * Builds a read-only Acceptance Criteria verification prompt for a secondary reviewer agent.
  */
-export function buildAcVerificationPrompt(task: TaskItem, branch: string): string {
+export function buildAcVerificationPrompt(
+  task: TaskItem,
+  branch: string,
+  skillInstructions: readonly string[] = []
+): string {
   const safeKey = validateTicketKey(task.key) ?? 'TASK-1'
   const safeTitle = sanitizeUntrustedText(task.title, 200)
   const safeBranch = validateBranchName(branch) ?? 'main'
@@ -765,7 +791,7 @@ export function buildAcVerificationPrompt(task: TaskItem, branch: string): strin
     '</untrusted_ticket_data>',
     '',
     '## Required Output',
-    '1. Write a JSON verdict file to `.orca/task-bridge/ac-' + safeKey + '.json` with this exact structure:',
+    '1. Write a JSON verdict file to `.orca/task-bridge/ac-' + safeKey + '.json` with this exact structure (strict JSON: every key and string value uses double-quote characters, even if the example below shows single quotes):',
     '```json',
     '{',
     '  "verdict": "READY_FOR_REVIEW",',
@@ -776,7 +802,9 @@ export function buildAcVerificationPrompt(task: TaskItem, branch: string): strin
     '}',
     '```',
     'Use `"verdict": "CHANGES_REQUIRED"` (and `"result": "FAIL"` on failing items) if anything is missing or tests fail.',
-    '2. Also output a concise Markdown verification table ending with `VERDICT: READY_FOR_REVIEW` or `VERDICT: CHANGES_REQUIRED`.'
+    '2. Also output a concise Markdown verification table ending with `VERDICT: READY_FOR_REVIEW` or `VERDICT: CHANGES_REQUIRED`.',
+    // `workflow.verify` skill guidance from `.task-bridge.json` (it was computed but never reached the prompt)
+    ...(skillInstructions.length > 0 ? ['', '## Repository Skill Guidance', ...skillInstructions] : [])
   ].join('\n')
 }
 
@@ -884,7 +912,7 @@ export function buildProposeAcPrompt(task: TaskItem, branch: string): string {
     '</untrusted_ticket_data>',
     '',
     '## Required Output',
-    `1. Write a JSON file to \`.orca/task-bridge/proposed-ac-${safeKey}.json\` with this exact structure:`,
+    `1. Write a JSON file to \`.orca/task-bridge/proposed-ac-${safeKey}.json\` with this exact structure (strict JSON: every key and string value uses double-quote characters, even if the example below shows single quotes):`,
     '```json',
     '{',
     '  "criteria": [',
@@ -901,7 +929,7 @@ declare module 'orca' {
   interface PluginRequests {
     'tasks.getState': { output: TaskBridgeState }
     'tasks.sync': {
-      input?: {
+      input: {
         provider?: TaskProvider | 'all'
         scope?: TaskScopeFilter
         jiraSiteId?: string
@@ -985,7 +1013,7 @@ declare module 'orca' {
       output: AssignToMeOutput
     }
     'tasks.discoverJiraMetadata': {
-      input?: DiscoverJiraMetadataInput
+      input: DiscoverJiraMetadataInput
       output: DiscoverJiraMetadataOutput
     }
     'tasks.createFromWorkspace': {

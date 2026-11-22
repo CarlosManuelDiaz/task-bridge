@@ -2,6 +2,53 @@
 
 All notable changes to Task Bridge are documented in this file.
 
+## [0.3.3] - 2026-11-22
+
+### Security
+- **Plan Lock shell classifier bypasses closed**: `isReadOnlyShellCommand` now rejects `$(...)` and backticks inside double quotes, unquoted `(`/`)`/`{`/`}` (subshells, PowerShell subexpressions and script blocks), git global options that run programs (`-c`, `--config-env`, `--exec-path`), git arguments that write files or spawn programs (`--output`, `--ext-diff`, `-O`/`--open-files-in-pager`), `rg --pre`, `ag --pager`, `fd -x/-X/--exec`, `tree -o/-R` and `file -C`. `git branch` is only allowed with listing flags.
+- **`guard.denyGitWrites` hardening**: Detects denied subcommands when git is invoked by path (`/usr/bin/git`), as `git.exe`, through wrappers (`env`, `command`, `xargs`) or nested shells (`sh -c "git push"`).
+- **Cold-start fail-closed**: When startup hydration exceeds the 400ms hook bound, `agent.tool.before` now denies mutating tool calls (read-only calls still pass) until hydration finishes, capped at 10 seconds, instead of failing open.
+- **Repo config can no longer relax the Plan Lock**: A committed `.task-bridge.json` may only tighten `requirePlanApproval` / `enforcePlanLock` (only the user's own repo profile can turn them off), and `planGate: "skill"` becomes `both` when the user enabled the plugin gate.
+- **No unlocked window at agent start**: With Plan Lock enforced, the worktree is created without `--agent`; the lock and workspace link are persisted (and the hook maps rebuilt) before the agent is launched.
+- **Multi-repo dispatches stay guarded**: `buildState` now rebuilds the hook maps with `rebuildLookupMaps`, so secondary repos (`linkedWorkspaces`) and AC reviewer/proposer terminals keep their lock and ticket context; each repo is linked as soon as its worktree exists.
+- **Stale AC artifacts**: Previous `ac-<KEY>.json` / `proposed-ac-<KEY>.json` files are removed before a new reviewer/proposer launches, so an old verdict or proposal is never read back as the new result.
+
+### Fixed
+- **Verify AC / Propose AC with Claude Code**: The AC reviewer/proposer write guards accepted only repo-relative paths, but Claude Code's `Write` tool always sends absolute paths, so verdict/proposal files were always denied. Absolute paths are now accepted when they resolve exactly to `<worktree>/.orca/task-bridge/ac-<KEY>.json` (or `proposed-ac-<KEY>.json`).
+- **Plan approval lost during dispatch**: The dispatch result used to overwrite the stored task with the snapshot read at the start (45s+ earlier), resetting a plan approved meanwhile. Dispatch now returns only the fields it decided and merges them onto the current task, keeping a newer approval. Same for subtask fan-out.
+- **PR URL / completion comment posted on the wrong ticket**: Workbench drafts (PR URL, completion comment, feedback text) are only sent for the ticket selected in Workbench, and are cleared whenever the selection changes.
+- **Subtask repo precedence**: A repo explicitly assigned to a subtask now wins over the parent's auto-resolved repo in `Dispatch Pending Subtasks`, which also gained the double-click guard `tasks.dispatch` already had.
+- **Multi-repo dispatch aborting on repo 2**: Repo 1's terminal is no longer carried into repo 2's launch, where the duplicate-agent guard rejected it.
+- **"Sync Tickets" command (`Mod+Shift+Y`)** now actually syncs. All syncs (panel, command, auto-sync) are serialized, so overlapping runs no longer race and the last scope click wins.
+- **Notion transitions without token or page ID** are reported as not synced (with the reason) instead of moving the ticket only locally; transition errors name the real provider instead of always `LINEAR`.
+- **`statusAliases` from `.task-bridge.json`** now apply to In Review / Done transitions, not only to dispatch.
+- **Commit summary** is rebuilt on every detection instead of growing on each agent turn (`a; b (a; b) (a; b)…`).
+- **`worktreeSetupCommands` on Windows**: `npm`/`pnpm`/`yarn`/`composer` shims run through `cmd.exe /d /s /c` (fixed allowlisted argv), and failures are shown as a notification instead of being ignored.
+- **AC reviewer without a terminal id** is reported as `unknown` with an explanation instead of staying `running` forever.
+- **Lost updates**: `detectPr`, `cleanupWorktree`, `addManual` and `delete` now write under the tasks lock and patch only their own fields; `addManual` keeps the links of an existing ticket with the same key.
+- **Panel error handling**: Every action surfaces worker errors in the banner (previously ~15 handlers dropped them, e.g. the Linear "missing In Review state" explanation), and a failed initial load no longer leaves the panel stuck on "Loading".
+- **Archive Worktree** now asks for a second press to confirm before removing the worktree folder, and is only offered for worktrees Task Bridge created itself (`worktreeCreatedByPlugin`; worktrees linked from the focused workspace or Create Ticket are never removed from the panel).
+- **Buttons no longer fire twice**: every action (sync, dispatch, subtasks, Verify/Propose AC, transitions, archive, feedback…) runs once at a time and its buttons are disabled while it runs.
+- **Comments only after a confirmed transition**: Jira and Linear completion comments and PR attachments are posted only when the status change succeeded; Jira failures now report the CLI's reason.
+- **Verify AC skill guidance**: `workflow.verify` skills from `.task-bridge.json` were computed but never reached the reviewer prompt; they now do.
+- **Verdict files on Windows**: The launch prompt replaces `"` with `'` on Windows, so agents could write single-quoted JSON and Verify AC ended as `unknown`. Prompts now ask for strict JSON in words, and verdict/proposal readers accept the single-quoted form.
+- **Propose AC / Create Ticket / proposer results** no longer fall back to an unrelated "first worktree": Propose AC picks the ticket's worktree, its assigned repo, the focused worktree or the only open repo (or asks you to choose); Create Ticket only registers the focused worktree, refuses one already linked to another ticket, and only shows the ticket as In Progress when Jira accepted the transition.
+- **Notion**: Sync honours `syncLimit` (up to 500 instead of a fixed 100), and every Notion request has a 20s timeout (combined with the caller's abort signal).
+- **`copyLocalSetupFiles`** never creates folders or copies files through a symlinked parent in the new worktree.
+- **`agent.prompt.before`**: turning off "Include completion runbook" only removes the runbook, not the ticket context and follow-up reminder.
+- **Event handlers** (`workspace.changed`, `agent.status.changed`) log redacted errors instead of producing unhandled rejections.
+- **Prompt boundaries**: Subtask fan-out notes only use validated keys (provider titles stay inside `<untrusted_ticket_data>`), and the user's own feedback instruction is placed outside the untrusted block.
+- **Jira comments in ADF** (Jira Cloud API v3) are converted to text instead of `[object Object]`.
+- **Completion runbook** uses `statusAliases.inReview` and tells the agent to pick the real (possibly localised) review state instead of hard-coding `In Review`.
+- **Sprints**: `closedSprints` is no longer reported as the active sprint; a `sprintJql` starting with `-` falls back to the default query instead of being parsed as a CLI flag.
+- **Branch type keywords** with accents (`corrección`, `añadir`) now match (Unicode word boundaries).
+- **Notion token**: saving an empty field no longer deletes the stored token; use the new **Clear Notion Token** button.
+- **Smaller fixes**: the limit badge shows the synced count, `tasks.transition` rejects unknown status categories, Jira/Linear/Notion URLs with `&` query strings are accepted, `validateRelativeRepoPath` rejects nested `.git`, Windows trailing dots/spaces and `:` streams, and Linear OAuth tokens, JWTs and private keys are redacted.
+
+### Developer
+- **Type checking**: `tsc --noEmit` passes with zero errors (it reported 137). Fixed drifted types in `protocol.ts` (`RepoConfigFile`, `DiscoveredSkill.sourceDir`, `RepoWorkflowMapping.dispatch`, required request inputs) and test typings (a `mockHost({ workspaces })` option that was silently ignored). Added `package.json` dev tooling (`npm run typecheck` / `npm run verify`) and Node types in `tsconfig.json`.
+- **`deriveUnassignedSprintJql` with `OR`**: Instead of removing the assignee term (which produced invalid JQL such as `(OR (...))` / `AND AND`, and broke `AND`/`OR` precedence), the term is substituted in place with `assignee is EMPTY` and the whole query is intersected with `AND assignee is EMPTY`.
+
 ## [0.3.2] - 2026-11-22
 
 ### Unassigned Sprint JQL Regex & Startup Hook Documentation
