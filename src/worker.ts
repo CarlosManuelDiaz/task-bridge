@@ -364,7 +364,7 @@ function mapPriority(raw: unknown): TaskPriority {
   return 'medium'
 }
 
-export const PLUGIN_VERSION = '0.3.1'
+export const PLUGIN_VERSION = '0.3.2'
 
 /**
  * Extracts structured Sprint / Cycle metadata from a Jira or Linear issue payload.
@@ -986,12 +986,32 @@ export function deriveUnassignedSprintJql(sprintJql?: string): string {
   const orderClause = orderMatch ? orderMatch[0] : ''
   const filterBody = (orderMatch ? base.slice(0, orderMatch.index) : base).trim()
 
-  const assigneePattern =
-    /\bassignee\s*(?:=\s*currentUser\s*\(\s*\)|in\s*\(\s*currentUser\s*\(\s*\)\s*\)|is\s+not\s+EMPTY)\b/i
+  const assigneeTermSource =
+    '\\bassignee\\s*(?:=\\s*currentUser\\s*\\(\\s*\\)|in\\s*\\(\\s*currentUser\\s*\\(\\s*\\)\\s*\\)|is\\s+not\\s+EMPTY(?=\\s|\\)|$))(?=\\s|\\)|$)'
+  const assigneePattern = new RegExp(assigneeTermSource, 'i')
+
   if (assigneePattern.test(filterBody)) {
-    return `${filterBody.replace(assigneePattern, 'assignee is EMPTY')}${orderClause}`
+    if (/\bOR\b/i.test(filterBody)) {
+      // When OR is present (e.g. `assignee = currentUser() OR reporter = currentUser()`),
+      // replacing in-place would yield `assignee is EMPTY OR reporter = currentUser()`,
+      // leaking tickets assigned to others. Strip the assignee condition and intersect with `AND assignee is EMPTY`.
+      const leftConnected = new RegExp(`${assigneeTermSource}\\s+\\b(?:OR|AND)\\b\\s*`, 'gi')
+      const rightConnected = new RegExp(`\\s*\\b(?:OR|AND)\\b\\s+${assigneeTermSource}`, 'gi')
+      const withoutAssignee = filterBody
+        .replace(leftConnected, '')
+        .replace(rightConnected, '')
+        .replace(new RegExp(assigneeTermSource, 'gi'), '')
+        .replace(/(?<![A-Za-z0-9_])\(\s*\)/g, '')
+        .replace(/\s{2,}/g, ' ')
+        .trim()
+      if (!withoutAssignee) {
+        return `sprint in openSprints() AND assignee is EMPTY AND statusCategory != Done${orderClause}`
+      }
+      return `(${withoutAssignee}) AND assignee is EMPTY${orderClause}`
+    }
+    return `${filterBody.replace(new RegExp(assigneeTermSource, 'gi'), 'assignee is EMPTY')}${orderClause}`
   }
-  if (/\bassignee\s+is\s+EMPTY\b/i.test(filterBody)) {
+  if (/\bassignee\s+is\s+EMPTY(?=\s|\)|$)/i.test(filterBody)) {
     return `${filterBody}${orderClause}`
   }
   const wrappedBody = /\bOR\b/i.test(filterBody) ? `(${filterBody})` : filterBody

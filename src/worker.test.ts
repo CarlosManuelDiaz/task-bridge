@@ -19,6 +19,7 @@ import * as main from './worker'
 import {
   buildDiagnosticsReport,
   copyLocalSetupFiles,
+  deriveUnassignedSprintJql,
   extractAcceptanceCriteriaFromText,
   mapIssueKind,
   mapStatusToCategory,
@@ -3865,4 +3866,56 @@ test('0.2.1 #2-#3 & 0.3.0 #4-#8: detects silent Jira auth failure, supports spri
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
+})
+
+test('0.3.2: deriveUnassignedSprintJql handles default JQL, assignee in (currentUser()), ORDER BY, missing assignee, and OR clauses', () => {
+  // 1. Default JQL (`assignee = currentUser()`)
+  assert.equal(
+    deriveUnassignedSprintJql(),
+    'sprint in openSprints() AND assignee is EMPTY AND statusCategory != Done'
+  )
+  assert.equal(
+    deriveUnassignedSprintJql(
+      'sprint in openSprints() AND assignee = currentUser() AND statusCategory != Done'
+    ),
+    'sprint in openSprints() AND assignee is EMPTY AND statusCategory != Done'
+  )
+
+  // 2. `assignee in (currentUser())` at end of query or mid-query
+  assert.equal(
+    deriveUnassignedSprintJql('sprint in openSprints() AND assignee in (currentUser())'),
+    'sprint in openSprints() AND assignee is EMPTY'
+  )
+  assert.equal(
+    deriveUnassignedSprintJql(
+      'project = ENG AND assignee in ( currentUser() ) AND sprint in openSprints()'
+    ),
+    'project = ENG AND assignee is EMPTY AND sprint in openSprints()'
+  )
+
+  // 3. With `ORDER BY rank`
+  assert.equal(
+    deriveUnassignedSprintJql(
+      'sprint in openSprints() AND assignee = currentUser() ORDER BY rank ASC'
+    ),
+    'sprint in openSprints() AND assignee is EMPTY ORDER BY rank ASC'
+  )
+
+  // 4. Without an assignee condition -> appends `AND assignee is EMPTY`
+  assert.equal(
+    deriveUnassignedSprintJql('project in (ENG, PLAT) AND sprint in openSprints()'),
+    'project in (ENG, PLAT) AND sprint in openSprints() AND assignee is EMPTY AND statusCategory != Done'
+  )
+
+  // 5. Edge case with `OR`: strips the assignee condition and intersects with `AND assignee is EMPTY` so tickets assigned to others never leak
+  assert.equal(
+    deriveUnassignedSprintJql('assignee = currentUser() OR reporter = currentUser()'),
+    '(reporter = currentUser()) AND assignee is EMPTY'
+  )
+  assert.equal(
+    deriveUnassignedSprintJql(
+      'sprint in openSprints() AND (assignee = currentUser() OR reporter = currentUser()) ORDER BY rank'
+    ),
+    '(sprint in openSprints() AND (reporter = currentUser())) AND assignee is EMPTY ORDER BY rank'
+  )
 })

@@ -2,6 +2,13 @@
 
 All notable changes to Task Bridge are documented in this file.
 
+## [0.3.2] - 2026-11-22
+
+### Unassigned Sprint JQL Regex & Startup Hook Documentation
+- **Fixed `deriveUnassignedSprintJql` matching for `assignee = currentUser()` and `assignee in (currentUser())`**: Replaced the trailing `\b` word-boundary assertion after `)` with `(?=\s|\)|$)` so `currentUser()` followed by whitespace, `)`, or end-of-string is properly replaced with `assignee is EMPTY` instead of appending a contradictory `AND assignee is EMPTY`.
+- **Handled `OR` disjunctions in `deriveUnassignedSprintJql`**: When `sprintJql` contains `OR` alongside an `assignee` clause (e.g. `assignee = currentUser() OR reporter = currentUser()`), stripped the `assignee` term before intersecting with `(<remaining jql>) AND assignee is EMPTY` so tickets assigned to other users are never included.
+- **Documented 400ms cold-startup hook trade-off**: Documented in `README.md` and `CHANGELOG.md` that bounding `initLookupPromise` at 400ms on worker activation prevents `agent.tool.before` 2000ms hook timeouts, with the trade-off that tool calls during the first 400ms fail open if cold storage/workspace hydration takes longer than 400ms.
+
 ## [0.3.1] - 2026-11-22
 
 ### Real Jira Cloud Verification Fixes

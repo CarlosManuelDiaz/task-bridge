@@ -7,7 +7,7 @@ Keep **Linear**, **Jira**, and **Notion** within reach in the Orca ADE right sid
 | Field | Value |
 | --- | --- |
 | Plugin ID | `task-bridge` |
-| Version | `0.3.1` |
+| Version | `0.3.2` |
 | Orca Requirement | `>=1.4.256` |
 | Execution | `trusted-worker` (`pluginApi: 1`) |
 | UI Mode | Declarative host-rendered `components` (`@stablyai/orca-plugin-sdk/ui`) |
@@ -125,7 +125,7 @@ Task Bridge reuses Orca's native **Linear** and **Jira** integrations (no duplic
 - **Local Untracked Setup File Copying**: Safely copies local config files (e.g., `.env.local`, `.claude/settings.local.json`) from the primary worktree into newly created worktrees (`validateRelativeRepoPath` blocks `..` traversal, symlinks, absolute paths, and `.git`).
 
 ### 6. Mandatory Plan-First Gate & Ticket Comment Feedback Loop
-- **Plan-First Gate & Tool Lock (`tasks.approvePlan` + `agent.tool.before`)**: Require agents to present an implementation plan before coding. With **Enforce Plan Lock** enabled, `agent.tool.before` denies `Edit`/`Write`/file-mutating tools and mutating `Bash` commands in Claude Code until you click **Approve Plan** in Queue, Fleet, or Workbench (read-only exploration like `Read`, `git status`, and `rg` remains allowed).
+- **Plan-First Gate & Tool Lock (`tasks.approvePlan` + `agent.tool.before`)**: Require agents to present an implementation plan before coding. With **Enforce Plan Lock** enabled, `agent.tool.before` denies `Edit`/`Write`/file-mutating tools and mutating `Bash` commands in Claude Code until you click **Approve Plan** in Queue, Fleet, or Workbench (read-only exploration like `Read`, `git status`, and `rg` remains allowed). On cold worker activation, startup lookup and repository config hydration are bounded by a 400ms race so `agent.tool.before` never hits Orca's 2000ms hook timeout (if cold storage/workspace hydration exceeds 400ms during the first tool call after a restart, the hook fails open for that window until hydration finishes).
 - **Ticket Comment Feedback Loop (`tasks.sendCommentFeedback`) & Fleet Auto-Sync**: Periodically refreshes active Fleet tickets (`autoSyncMinutes`, default `5m`), pulls new Jira/Linear/Notion comments with an unread badge, and forwards reviewer feedback (isolated inside `<untrusted_ticket_data>`) to the linked workspace agent.
 
 ---
