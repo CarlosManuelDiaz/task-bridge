@@ -2,21 +2,28 @@
 
 All notable changes to Task Bridge are documented in this file.
 
+## [0.3.1] - 2026-11-22
+
+### Real Jira Cloud Verification Fixes
+- **Plain-string Jira sprint names & multi-sprint grouping**: Updated `extractSprintInfo` to accept plain sprint name strings (`"sprint": "Sprint 42"`) as returned by `orca jira search` / `orca jira list`, tracked all open sprints in `activeSprints`, and grouped Queue cards by sprint when multiple sprints are open simultaneously.
+- **CLI query errors vs. expired token warning**: Distinguished `ok: false` CLI responses (such as invalid `sprintJql` syntax) as `Jira Query Error` displaying `error.message` directly, reserving the expired API token warning strictly for connected sites that return 0 tickets and 0 projects.
+- **Derived `Unassigned in Sprint` JQL**: Derived the unassigned sprint query from the user's configured `sprintJql` (`deriveUnassignedSprintJql`) so project and board filters are respected.
+- **Safe Jira assignment & ticket creation validation**: Used `sites[].accountId` from `orca jira connection` directly for `orca jira assignee set --to-id`, avoided selecting the first unfiltered user from `orca jira assignee list`, and threw an explicit error when `orca jira create` does not return a valid ticket key instead of falling back to `${projectKey}-1`.
+- **Staged `proposedAcceptanceCriteria` approval (`Accept Proposed AC`)**: Stored `Propose AC` results in `proposedAcceptanceCriteria` and added an **Accept Proposed AC** action (`tasks.acceptProposedAc`) in Workbench so unapproved criteria never overwrite `acceptanceCriteria` before `Verify AC`.
+- **Truncation badge wording**: Updated the truncation badge in Queue to `Showing X (limit reached)`.
+- **Bounded startup hook initialization**: Added immediate startup repository scanning with a 400ms `Promise.race` bound on `initLookupPromise` so `agent.tool.before` never blocks even if `workspace.changed` is not emitted on activation.
+
 ## [0.3.0] - 2026-11-22
 
-### Sprint / Cycle Scope, Undefined Ticket Guards & Unlinked Worktree Registration
-- **Sprint / Cycle scope (`#4`)**: Added `'sprint'` scope filter (`Sprint` pill in Queue). Queries Jira via `orca jira search <sprintJql>` (configurable via `sprintJql` setting, defaulting to `sprint in openSprints() AND assignee = currentUser() AND statusCategory != Done`) and Linear via `orca linear list-issues --cycle active`, while showing an informational notice when Notion is selected.
-- **Sprint Header (`#5`)**: Extracted sprint and cycle metadata (`name`, `goal`, `startDate`, `endDate`, `daysRemaining`, and overdue detection when an open sprint is past its end date) from ticket payloads and rendered a live Sprint Header card in Queue.
-- **Undefined ticket warnings & Propose AC (`#6`)**: Flagged tickets lacking a description (`No Description`) or Acceptance Criteria (`Missing AC`) in Queue and Workbench, warned before/upon dispatch, and added **Propose AC** (`tasks.proposeAcceptanceCriteria`) to launch a read-only analyst agent that drafts criteria from the ticket and codebase and posts them as a ticket comment (`orca jira comment add`) without modifying the ticket description.
-- **Register unlinked worktree work (`#7`)**: Added **Create Ticket** (`tasks.createFromWorkspace` + `tasks.discoverJiraMetadata`) when the focused worktree has no linked ticket, deriving the title and description from the Git branch and recent commits (`orca jira create`), assigning the created ticket to the user, and linking/renaming the worktree.
-- **Unassigned in Sprint (`#8`)**: Added an **Unassigned in Sprint** collapsible section in Sprint scope with 1-click **Assign to Me** (`tasks.assignToMe` via `orca jira assignee list` + `orca jira assignee set`).
-
-## [0.2.1] - 2026-11-22
-
-### Performance & Sync Reliability Fixes
-- **Zero-I/O `agent.tool.before` hook & negative config caching (`#1`)**: Cached negative `.task-bridge.json` lookups (`null` with `mtimeMs` tracking), moved repository scanning to worker activation and `workspace.changed`, and removed all `workspace.list` / filesystem I/O from `agent.tool.before` so tool calls never hit Orca's 2000ms hook timeout in repositories without `.task-bridge.json`.
-- **Silent Jira credential / expired token detection (`#2`)**: Probed `orca jira project list` whenever a connected Jira site returns 0 tickets; surfaced a clear `"Jira returned no data: check your API token in Settings → Jira"` warning callout, tracked `lastSyncedWithDataAt` (`Last synced with data`), and marked cached tickets as potentially outdated (`Cached (may be outdated)`).
-- **Configurable `syncLimit` & truncation indicator (`#3`)**: Added `syncLimit` setting (`50`, `100`, `200`, `500`, default `100`) and displayed `"Showing X of Y"` in Queue when provider results are truncated.
+### Sprint / Cycle Scope, Undefined Ticket Guards, Unlinked Worktree Registration & Hook Caching
+- **Sprint / Cycle scope**: Added `'sprint'` scope filter (`Sprint` pill in Queue). Queries Jira via `orca jira search <sprintJql>` (configurable via `sprintJql` setting, defaulting to `sprint in openSprints() AND assignee = currentUser() AND statusCategory != Done`) and Linear via `orca linear list-issues --cycle active`, while showing an informational notice when Notion is selected.
+- **Sprint Header**: Extracted sprint and cycle names from ticket payloads and rendered a Sprint Header card in Queue.
+- **Undefined ticket warnings & Propose AC**: Flagged tickets lacking a description (`No Description`) or Acceptance Criteria (`Missing AC`) in Queue and Workbench, warned before/upon dispatch, and added **Propose AC** (`tasks.proposeAcceptanceCriteria`) to launch a read-only analyst agent that drafts criteria from the ticket and codebase and posts them as a ticket comment (`orca jira comment add`) without modifying the ticket description.
+- **Register unlinked worktree work**: Added **Create Ticket** (`tasks.createFromWorkspace` + `tasks.discoverJiraMetadata`) when the focused worktree has no linked ticket, deriving the title and description from the Git branch and recent commits (`orca jira create`), assigning the created ticket to the user, and linking/renaming the worktree.
+- **Unassigned in Sprint**: Added an **Unassigned in Sprint** collapsible section in Sprint scope with 1-click **Assign to Me** (`tasks.assignToMe`).
+- **Zero-I/O `agent.tool.before` hook & negative config caching**: Cached negative `.task-bridge.json` lookups (`null` with `mtimeMs` tracking), moved repository scanning to worker activation and `workspace.changed`, and removed all `workspace.list` / filesystem I/O from `agent.tool.before` so tool calls never hit Orca's 2000ms hook timeout in repositories without `.task-bridge.json`.
+- **Silent Jira credential / expired token detection**: Probed `orca jira project list` whenever a connected Jira site returns 0 tickets; surfaced a clear `"Jira returned no data: check your API token in Settings → Jira"` warning callout, tracked `lastSyncedWithDataAt` (`Last synced with data`), and marked cached tickets as potentially outdated (`Cached (may be outdated)`).
+- **Configurable `syncLimit` & truncation indicator**: Added `syncLimit` setting (`50`, `100`, `200`, `500`, default `100`) and displayed a limit indicator in Queue when provider results are truncated.
 
 ## [0.2.0] - 2026-11-16
 

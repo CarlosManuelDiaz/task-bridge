@@ -3541,6 +3541,8 @@ test('0.2.1 #2-#3 & 0.3.0 #4-#8: detects silent Jira auth failure, supports spri
     })
 
     let simulateExpiredToken = false
+    let simulateBadJqlError = false
+    let simulateCreateMissingKey = false
     let availableProjects: Array<{ id: string; key: string; name: string }> = [
       { id: '100', key: 'ENG', name: 'Engineering' }
     ]
@@ -3548,16 +3550,20 @@ test('0.2.1 #2-#3 & 0.3.0 #4-#8: detects silent Jira auth failure, supports spri
     const assignedIssues: Array<{ key: string; accountId: string }> = []
     const searchCalls: string[][] = []
 
-    // Past date (overdue sprint) to verify overdue sprint header detection (#5)
-    const pastEndDate = new Date(Date.now() - 3 * 86_400_000).toISOString()
-    const startDate = new Date(Date.now() - 17 * 86_400_000).toISOString()
-
     setCliRunnerForTests(async (args) => {
       if (args[0] === 'jira' && args[1] === 'connection') {
         return {
           ok: true,
           result: {
-            sites: [{ id: 's1', siteUrl: 'https://acme.atlassian.net', email: 'alex@acme.com' }],
+            sites: [
+              {
+                id: 's1',
+                siteUrl: 'https://acme.atlassian.net',
+                email: 'alex@acme.com',
+                accountId: 'acc-alex-99',
+                displayName: 'Alex Rivera'
+              }
+            ],
             selectedSiteId: 's1'
           }
         }
@@ -3590,7 +3596,8 @@ test('0.2.1 #2-#3 & 0.3.0 #4-#8: detects silent Jira auth failure, supports spri
                 summary: 'Undefined ticket without AC',
                 description: '',
                 status: { name: 'To Do', categoryKey: 'new' },
-                project: { key: 'ENG' }
+                project: { key: 'ENG' },
+                sprint: 'Sprint 42'
               }
             ],
             total: 350,
@@ -3600,6 +3607,15 @@ test('0.2.1 #2-#3 & 0.3.0 #4-#8: detects silent Jira auth failure, supports spri
       }
       if (args[0] === 'jira' && args[1] === 'search') {
         searchCalls.push([...args])
+        if (simulateBadJqlError) {
+          return {
+            ok: false,
+            error: {
+              code: 'jira_bad_request',
+              message: 'Error 400: Error in JQL query: unexpected token near sprintJql'
+            }
+          }
+        }
         const jql = args[2] ?? ''
         if (jql.includes('assignee is EMPTY')) {
           return {
@@ -3611,14 +3627,7 @@ test('0.2.1 #2-#3 & 0.3.0 #4-#8: detects silent Jira auth failure, supports spri
                 status: { name: 'To Do', categoryKey: 'new' },
                 project: { key: 'ENG' },
                 assignee: 'Unassigned',
-                sprint: {
-                  id: 'sp-42',
-                  name: 'Sprint 42',
-                  goal: 'Ship Sprint 0.3.0',
-                  state: 'active',
-                  startDate,
-                  endDate: pastEndDate
-                }
+                sprint: 'Sprint 42'
               }
             ]
           }
@@ -3633,14 +3642,16 @@ test('0.2.1 #2-#3 & 0.3.0 #4-#8: detects silent Jira auth failure, supports spri
               status: { name: 'In Progress', categoryKey: 'indeterminate' },
               project: { key: 'ENG' },
               assignee: { displayName: 'Alex Rivera' },
-              sprint: {
-                id: 'sp-42',
-                name: 'Sprint 42',
-                goal: 'Ship Sprint 0.3.0',
-                state: 'active',
-                startDate,
-                endDate: pastEndDate
-              }
+              sprint: 'Sprint 42'
+            },
+            {
+              key: 'PLAT-105',
+              summary: 'Cross-board open sprint ticket',
+              description: 'Valid description',
+              status: { name: 'To Do', categoryKey: 'new' },
+              project: { key: 'PLAT' },
+              assignee: { displayName: 'Alex Rivera' },
+              sprint: 'Platform Sprint 9'
             }
           ]
         }
@@ -3649,6 +3660,7 @@ test('0.2.1 #2-#3 & 0.3.0 #4-#8: detects silent Jira auth failure, supports spri
         return {
           ok: true,
           result: [
+            { accountId: 'acc-other-00', displayName: 'Random First User' },
             { accountId: 'acc-alex-99', displayName: 'Alex Rivera', emailAddress: 'alex@acme.com' }
           ]
         }
@@ -3666,6 +3678,9 @@ test('0.2.1 #2-#3 & 0.3.0 #4-#8: detects silent Jira auth failure, supports spri
         return { ok: true, result: {} }
       }
       if (args[0] === 'jira' && args[1] === 'create') {
+        if (simulateCreateMissingKey) {
+          return { ok: true, result: {} }
+        }
         return {
           ok: true,
           result: {
@@ -3703,11 +3718,16 @@ test('0.2.1 #2-#3 & 0.3.0 #4-#8: detects silent Jira auth failure, supports spri
       assert.equal(syncExpired.state.cachedTasksMayBeStale, true)
       assert.equal(syncExpired.state.tasks.find((t) => t.key === 'ENG-701')?.staleFromFailedSync, true)
 
-      // 2b. Valid token with 0 tickets but >=1 project -> syncStatus is 'empty', not 'auth_warning'
+      // 2b. Simulate bad JQL error (`ok: false`): must show CLI error.message with syncStatus === 'error' (NOT token warning)
       simulateExpiredToken = false
+      simulateBadJqlError = true
+      const syncBadJql = await worker.request('tasks.sync', { provider: 'jira', scope: 'sprint' })
+      assert.equal(syncBadJql.state.jiraSyncStatus, 'error')
+      assert.match(String(syncBadJql.state.jiraAuthWarning), /Error 400: Error in JQL query/)
+      simulateBadJqlError = false
       availableProjects = [{ id: '100', key: 'ENG', name: 'Engineering' }]
 
-      // 3. Sprint scope (#4) + Sprint Header with overdue warning (#5) + Unassigned in Sprint (#8)
+      // 3. Sprint scope (#4) with plain-string `sprint` + multiple open sprints (#1, #2) + derived Unassigned JQL (#4, #8)
       const syncSprint = await worker.request('tasks.sync', { provider: 'jira', scope: 'sprint' })
       assert.equal(syncSprint.state.scope, 'sprint')
       assert.ok(
@@ -3717,14 +3737,26 @@ test('0.2.1 #2-#3 & 0.3.0 #4-#8: detects silent Jira auth failure, supports spri
             c[c.indexOf('--limit') + 1] === '200'
         )
       )
+      // Verify Unassigned in Sprint query is derived from `sprintJql` (preserving `project in (ENG, PLAT)`)
+      assert.ok(
+        searchCalls.some((c) =>
+          c.includes(
+            'project in (ENG, PLAT) AND sprint in openSprints() AND assignee is EMPTY AND statusCategory != Done'
+          )
+        ),
+        'Expected unassigned sprint search JQL to inherit project filter from sprintJql'
+      )
       assert.ok(syncSprint.state.activeSprint)
       assert.equal(syncSprint.state.activeSprint?.name, 'Sprint 42')
-      assert.equal(syncSprint.state.activeSprint?.isOverdue, true)
-      assert.ok((syncSprint.state.activeSprint?.overdueDays ?? 0) >= 2)
+      assert.equal(syncSprint.state.activeSprints?.length, 2)
+      assert.deepEqual(
+        syncSprint.state.activeSprints?.map((s) => s.name),
+        ['Sprint 42', 'Platform Sprint 9']
+      )
       assert.equal(syncSprint.state.unassignedSprintTasks?.length, 1)
       assert.equal(syncSprint.state.unassignedSprintTasks?.[0]?.key, 'ENG-702')
 
-      // 4. Assign unassigned sprint ticket to me (#8)
+      // 4. Assign unassigned sprint ticket to me using `sites[].accountId` directly (#5, #8)
       const assignRes = await worker.request('tasks.assignToMe', { taskId: 'jira:ENG-702' })
       assert.equal(assignRes.assigned, true)
       assert.equal(assignRes.assignee, 'Alex Rivera')
@@ -3732,7 +3764,7 @@ test('0.2.1 #2-#3 & 0.3.0 #4-#8: detects silent Jira auth failure, supports spri
       assert.equal(assignRes.state.unassignedSprintTasks?.length, 0)
       assert.equal(assignRes.state.tasks.find((t) => t.key === 'ENG-702')?.assignee, 'Alex Rivera')
 
-      // 5. Propose Acceptance Criteria (#6): read-only proposer agent writes `.orca/task-bridge/proposed-ac-ENG-701.json` and posts comment
+      // 5. Propose Acceptance Criteria (#6): stages in `proposedAcceptanceCriteria` without overwriting `acceptanceCriteria` until `tasks.acceptProposedAc`
       const proposeRes = await worker.request('tasks.proposeAcceptanceCriteria', {
         taskId: 'jira:ENG-701',
         reviewerAgent: 'claude'
@@ -3779,16 +3811,41 @@ test('0.2.1 #2-#3 & 0.3.0 #4-#8: detects silent Jira auth failure, supports spri
       assert.equal(postedComments[0]?.key, 'ENG-701')
       assert.match(postedComments[0]!.body, /Cache hit returns within 5ms/)
       const stateAfterPropose = await worker.request('tasks.getState')
-      assert.deepEqual(
-        stateAfterPropose.tasks.find((t) => t.key === 'ENG-701')?.acceptanceCriteria,
-        ['Cache hit returns within 5ms', 'Invalidation clears stale keys']
+      const taskAfterPropose = stateAfterPropose.tasks.find((t) => t.key === 'ENG-701')
+      assert.deepEqual(taskAfterPropose?.acceptanceCriteria, [])
+      assert.deepEqual(taskAfterPropose?.proposedAcceptanceCriteria, [
+        'Cache hit returns within 5ms',
+        'Invalidation clears stale keys'
+      ])
+
+      const acceptAcRes = await worker.request('tasks.acceptProposedAc', {
+        taskId: 'jira:ENG-701'
+      })
+      assert.deepEqual(acceptAcRes.acceptanceCriteria, [
+        'Cache hit returns within 5ms',
+        'Invalidation clears stale keys'
+      ])
+      assert.equal(
+        acceptAcRes.state.tasks.find((t) => t.key === 'ENG-701')?.proposedAcceptanceCriteria,
+        undefined
       )
 
-      // 6. Register unlinked worktree work (#7): discover metadata + create ticket from active branch & commits
+      // 6. Register unlinked worktree work (#5, #7): throws if `orca jira create` returns no key, never falls back to ENG-1
       const metaRes = await worker.request('tasks.discoverJiraMetadata', { projectKey: 'ENG' })
       assert.equal(metaRes.projects.length, 1)
       assert.equal(metaRes.issueTypes.length, 1)
       assert.equal(metaRes.issueTypes[0]?.id, '10001')
+
+      simulateCreateMissingKey = true
+      await assert.rejects(
+        () =>
+          worker.request('tasks.createFromWorkspace', {
+            projectKey: 'ENG',
+            issueTypeId: '10001'
+          }),
+        /did not return a valid issue key/
+      )
+      simulateCreateMissingKey = false
 
       const createdRes = await worker.request('tasks.createFromWorkspace', {
         projectKey: 'ENG',
@@ -3798,6 +3855,7 @@ test('0.2.1 #2-#3 & 0.3.0 #4-#8: detects silent Jira auth failure, supports spri
       assert.equal(createdRes.created.title, 'unlinked memory cache')
       assert.match(createdRes.created.description, /Add memory cache layer/)
       assert.equal(createdRes.created.linkedBranch, 'feat/unlinked-memory-cache')
+      assert.equal(createdRes.created.assignee, 'Alex Rivera')
       assert.equal(createdRes.state.activeTaskId, 'jira:ENG-799')
     } finally {
       setRepoToolRunnerForTests(null)

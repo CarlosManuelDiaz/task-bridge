@@ -206,6 +206,7 @@ export interface TaskItem {
   acVerificationSummary?: string
   acReviewerTerminalId?: string
   acProposerTerminalId?: string
+  proposedAcceptanceCriteria?: string[]
   sprint?: SprintInfo | null
   staleFromFailedSync?: boolean
   repoId?: string
@@ -229,6 +230,8 @@ export interface JiraSiteConnection {
   id: string
   siteUrl: string
   email: string
+  accountId?: string
+  displayName?: string
 }
 
 export interface FleetItem {
@@ -290,13 +293,14 @@ export interface TaskBridgeState {
   lastSyncedAt: number | null
   lastSyncedWithDataAt?: number | null
   jiraAuthWarning?: string | null
-  jiraSyncStatus?: 'ok' | 'empty' | 'auth_warning'
+  jiraSyncStatus?: 'ok' | 'empty' | 'auth_warning' | 'error'
   cachedTasksMayBeStale?: boolean
   syncLimit?: number
   syncTruncated?: boolean
   syncTotalCount?: number | null
   sprintJql?: string
   activeSprint?: SprintInfo | null
+  activeSprints?: SprintInfo[]
   unassignedSprintTasks?: TaskItem[]
   defaultJiraProject?: string
   defaultJiraIssueType?: string
@@ -810,6 +814,16 @@ export interface ProposeAcOutput {
   summary: string
 }
 
+export interface AcceptProposedAcInput {
+  taskId: string
+}
+
+export interface AcceptProposedAcOutput {
+  state: TaskBridgeState
+  acceptanceCriteria: string[]
+  summary: string
+}
+
 export interface AssignToMeInput {
   taskId: string
 }
@@ -961,6 +975,10 @@ declare module 'orca' {
     'tasks.proposeAcceptanceCriteria': {
       input: ProposeAcInput
       output: ProposeAcOutput
+    }
+    'tasks.acceptProposedAc': {
+      input: AcceptProposedAcInput
+      output: AcceptProposedAcOutput
     }
     'tasks.assignToMe': {
       input: AssignToMeInput

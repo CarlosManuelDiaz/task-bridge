@@ -7,7 +7,7 @@ Keep **Linear**, **Jira**, and **Notion** within reach in the Orca ADE right sid
 | Field | Value |
 | --- | --- |
 | Plugin ID | `task-bridge` |
-| Version | `0.3.0` |
+| Version | `0.3.1` |
 | Orca Requirement | `>=1.4.256` |
 | Execution | `trusted-worker` (`pluginApi: 1`) |
 | UI Mode | Declarative host-rendered `components` (`@stablyai/orca-plugin-sdk/ui`) |
@@ -91,14 +91,14 @@ Task Bridge reuses Orca's native **Linear** and **Jira** integrations (no duplic
 ### 1. Multi-Provider Sync, Sprint Scope & Silent Failure Detection
 - **Zero-config Linear & Jira integration with deep hydration**: Reuses `orca linear` and `orca jira` authentication, hydrates full descriptions, Acceptance Criteria checklists, and bidirectional parent/subtask relationships (`orca linear issue <key> --children --depth 1` and `orca jira issue <key>`).
 - **Sprint (Jira) & Active Cycle (Linear) Scope**: Switch the **Scope** filter in **Queue** to **`Sprint`** to query your active Jira sprint via `orca jira search <sprintJql> --site <id>` (customizable via **`sprintJql`**, e.g. `project in (ENG, PLAT) AND sprint in openSprints()`) or your active Linear team cycle (`orca linear list-issues --cycle active`).
-- **Sprint Header & Overdue Alert**: Automatically displays the active sprint/cycle name, goal, start/end dates, remaining days, and a warning banner if the sprint is still open past its scheduled end date (`Ended N days ago`).
-- **Unassigned in Sprint (`Assign to Me`)**: Lists unassigned tickets in the active sprint inside a collapsible **Unassigned in Sprint** section with a one-click **`Assign to Me`** button (`orca jira assignee list` + `orca jira assignee set`).
-- **Silent Jira Auth Failure Detection**: When `orca jira connection` reports connected but sync returns 0 tickets, Task Bridge probes `orca jira project list` to distinguish a genuinely empty queue from an expired/revoked API token, surfacing a clear warning banner while preserving cached tickets marked as `Cached (may be outdated)` alongside `Last synced with data`.
-- **Configurable `syncLimit` & Truncation Indicator**: Sync up to `50`, `100` (default), `200`, or `500` tickets per provider and see `Showing X of Y` whenever results are truncated.
+- **Sprint Header & Multi-Sprint Grouping**: Parses the sprint name returned by `orca jira search` / `orca jira list` (`"sprint": "Sprint 42"`) and groups the queue by sprint when multiple open sprints are active across boards.
+- **Unassigned in Sprint (`Assign to Me`)**: Derives the unassigned query directly from your configured `sprintJql` and lists unassigned tickets in the active sprint inside a collapsible **Unassigned in Sprint** section with a one-click **`Assign to Me`** button (`orca jira assignee set --to-id <accountId>`).
+- **Silent Jira Auth Failure vs. Query Error Detection**: When `orca jira connection` reports connected but sync returns 0 tickets, Task Bridge probes `orca jira project list` to distinguish a genuinely empty queue from an expired/revoked API token (`Jira Connection Warning`), while surfacing CLI query errors (`ok: false`, such as invalid `sprintJql`) directly as `Jira Query Error`.
+- **Configurable `syncLimit` & Limit Indicator**: Sync up to `50`, `100` (default), `200`, or `500` tickets per provider and see `Showing X (limit reached)` whenever results reach the configured limit.
 - **Encrypted Notion Database sync**: Stores your Notion Integration Token inside Orca's OS-backed encrypted secret store (`host.secrets`), supports cursor pagination and both `status` and `select` properties, and derives deterministic ticket keys from page IDs.
 - **Instant Scope & Project Filters**: Filter your queue by **Assigned**, **Sprint**, **Reported**, **All**, or **Done**, narrow down by **Provider** (`Linear`, `Jira`, `Notion`) or **Project**, and search by ticket key, title, or assignee.
-- **Undefined Ticket Warnings & `Propose AC`**: Flags tickets missing a description (`No Description`) or Acceptance Criteria (`Missing AC`) in Queue and Workbench, and provides a **`Propose AC`** button (`tasks.proposeAcceptanceCriteria`) that launches a strictly read-only analyst agent to draft testable Acceptance Criteria from the ticket and codebase and post them as a comment (`orca jira comment add`) without overwriting the ticket description.
-- **Register Work Without a Ticket (`Create Ticket`)**: When your active Orca worktree has no linked ticket, Queue displays an **Unlinked Worktree** card that discovers your Jira projects/issue types and creates a Jira ticket (`orca jira create`) pre-filled from the branch name and recent `git log` commits, assigns it to you, and links/renames the worktree.
+- **Undefined Ticket Warnings, `Propose AC` & `Accept Proposed AC`**: Flags tickets missing a description (`No Description`) or Acceptance Criteria (`Missing AC`) in Queue and Workbench, and provides a **`Propose AC`** button (`tasks.proposeAcceptanceCriteria`) that launches a strictly read-only analyst agent to draft testable Acceptance Criteria from the ticket and codebase, post them as a comment (`orca jira comment add`), and stage them in `proposedAcceptanceCriteria` until you click **`Accept Proposed AC`** in Workbench.
+- **Register Work Without a Ticket (`Create Ticket`)**: When your active Orca worktree has no linked ticket, Queue displays an **Unlinked Worktree** card that discovers your Jira projects/issue types and creates a Jira ticket (`orca jira create`) pre-filled from the branch name and recent `git log` commits, assigns it to your Jira account, and links/renames the worktree.
 
 ### 2. In-Flight Fleet View (Tickets × Live Agents)
 - The **Fleet** tab crosses dispatched tickets with `agents.list`, `workspace.list`, and `agent.status.changed` events by workspace and terminal ID.

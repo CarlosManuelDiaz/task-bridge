@@ -9,6 +9,8 @@ import {
   buildAgentPrompt,
   buildBranchName,
   buildProposeAcPrompt,
+  type AcceptProposedAcInput,
+  type AcceptProposedAcOutput,
   type AcVerificationStatus,
   type AddManualTaskInput,
   type AgentAvailability,
@@ -362,10 +364,12 @@ function mapPriority(raw: unknown): TaskPriority {
   return 'medium'
 }
 
-export const PLUGIN_VERSION = '0.3.0'
+export const PLUGIN_VERSION = '0.3.1'
 
 /**
  * Extracts structured Sprint / Cycle metadata from a Jira or Linear issue payload.
+ * Orca's Jira CLI returns `sprint` as a plain string (`"sprint": "Sprint 42"`),
+ * whereas Linear cycles or custom payloads may provide an object.
  */
 export function extractSprintInfo(
   row: Record<string, unknown>,
@@ -393,7 +397,28 @@ export function extractSprintInfo(
         typeof s === 'object' &&
         String((s as Record<string, unknown>).state ?? '').toLowerCase() === 'active'
     )
-    rawSprint = activeEntry ?? rawSprint[rawSprint.length - 1]
+    const nonEmptyStrings = rawSprint.filter(
+      (s): s is string => typeof s === 'string' && Boolean(s.trim())
+    )
+    rawSprint =
+      activeEntry ??
+      (nonEmptyStrings.length > 0
+        ? nonEmptyStrings[nonEmptyStrings.length - 1]
+        : rawSprint[rawSprint.length - 1])
+  }
+
+  if (typeof rawSprint === 'string') {
+    const cleanName = sanitizeUntrustedText(rawSprint.trim(), 120)
+    if (!cleanName) return null
+    return {
+      id: cleanName,
+      name: cleanName,
+      state: 'active',
+      daysRemaining: null,
+      overdueDays: null,
+      isOverdue: false,
+      provider
+    }
   }
 
   if (!rawSprint || typeof rawSprint !== 'object' || Array.isArray(rawSprint)) {
@@ -952,6 +977,31 @@ const DEFAULT_SPRINT_JQL =
   'sprint in openSprints() AND assignee = currentUser() AND statusCategory != Done'
 
 /**
+ * Derives the "Unassigned in Sprint" JQL query from the user's configured `sprintJql`
+ * so project/board filters in `sprintJql` are preserved instead of querying all open sprints site-wide.
+ */
+export function deriveUnassignedSprintJql(sprintJql?: string): string {
+  const base = (sprintJql && sprintJql.trim()) || DEFAULT_SPRINT_JQL
+  const orderMatch = /\s+\bORDER\s+BY\b[\s\S]*$/i.exec(base)
+  const orderClause = orderMatch ? orderMatch[0] : ''
+  const filterBody = (orderMatch ? base.slice(0, orderMatch.index) : base).trim()
+
+  const assigneePattern =
+    /\bassignee\s*(?:=\s*currentUser\s*\(\s*\)|in\s*\(\s*currentUser\s*\(\s*\)\s*\)|is\s+not\s+EMPTY)\b/i
+  if (assigneePattern.test(filterBody)) {
+    return `${filterBody.replace(assigneePattern, 'assignee is EMPTY')}${orderClause}`
+  }
+  if (/\bassignee\s+is\s+EMPTY\b/i.test(filterBody)) {
+    return `${filterBody}${orderClause}`
+  }
+  const wrappedBody = /\bOR\b/i.test(filterBody) ? `(${filterBody})` : filterBody
+  const statusSuffix = /\bstatus(?:Category)?\b/i.test(filterBody)
+    ? ''
+    : ' AND statusCategory != Done'
+  return `${wrappedBody} AND assignee is EMPTY${statusSuffix}${orderClause}`
+}
+
+/**
  * Fetches Jira issues for a site via `orca jira list` (or `orca jira search` for `sprint` scope),
  * detects silent credential failures via `orca jira project list` when 0 items return,
  * and hydrates full descriptions, acceptance criteria, and parent/child relationships.
@@ -966,7 +1016,7 @@ async function fetchJiraTasksWithHierarchy(
   unassignedSprintItems: TaskItem[]
   truncated: boolean
   totalCount: number | null
-  syncStatus: 'ok' | 'empty' | 'auth_warning'
+  syncStatus: 'ok' | 'empty' | 'auth_warning' | 'error'
   authWarning: string | null
 }> {
   const limitNum = Math.min(Math.max(options?.syncLimit ?? 100, 10), 500)
@@ -988,14 +1038,24 @@ async function fetchJiraTasksWithHierarchy(
         )
 
   if (jiraListAns?.ok !== true || !jiraListAns.result) {
+    const errObj =
+      jiraListAns?.error && typeof jiraListAns.error === 'object'
+        ? (jiraListAns.error as Record<string, unknown>)
+        : null
+    const rawErrMessage =
+      errObj?.message ??
+      (typeof jiraListAns?.error === 'string' ? jiraListAns.error : '') ??
+      'Jira query failed.'
+    const cleanErr = redactSecrets(
+      sanitizeUntrustedText(String(rawErrMessage || 'Jira query failed.'), 240)
+    )
     return {
       items: [],
       unassignedSprintItems: [],
       truncated: false,
       totalCount: null,
-      syncStatus: 'auth_warning',
-      authWarning:
-        'Jira returned no data: check your API token in Settings → Jira.'
+      syncStatus: 'error',
+      authWarning: cleanErr || 'Jira query failed.'
     }
   }
 
@@ -1017,11 +1077,12 @@ async function fetchJiraTasksWithHierarchy(
     const unassignedFromMain = items.filter(
       (t) => !t.assignee || t.assignee.toLowerCase() === 'unassigned'
     )
+    const unassignedJql = deriveUnassignedSprintJql(effectiveSprintJql)
     const unassignedAns = await runOrcaCli(
       [
         'jira',
         'search',
-        'sprint in openSprints() AND assignee is EMPTY AND statusCategory != Done',
+        unassignedJql,
         '--site',
         siteId,
         '--limit',
@@ -2964,7 +3025,7 @@ export default function activate(orca: OrcaWorkerApi): void {
   let cachedLinearConnected = false
   let lastWorkerError: string | null = null
   let cachedJiraAuthWarning: string | null = null
-  let cachedJiraSyncStatus: 'ok' | 'empty' | 'auth_warning' = 'ok'
+  let cachedJiraSyncStatus: 'ok' | 'empty' | 'auth_warning' | 'error' = 'ok'
   let cachedSyncTruncated = false
   let cachedSyncTotalCount: number | null = null
   let cachedUnassignedSprintTasks: TaskItem[] = []
@@ -3694,6 +3755,22 @@ export default function activate(orca: OrcaWorkerApi): void {
     }
   }
 
+  let startupWorkspaceListPromise: Promise<HostWorkspaceEntry[]> | null = null
+
+  function fetchStartupWorkspacesOnce(): Promise<HostWorkspaceEntry[]> {
+    if (!startupWorkspaceListPromise) {
+      startupWorkspaceListPromise = (async () => {
+        try {
+          const wsRes = await orca.host.call('workspace.list')
+          return Array.isArray(wsRes?.workspaces) ? wsRes.workspaces : []
+        } catch {
+          return []
+        }
+      })()
+    }
+    return startupWorkspaceListPromise
+  }
+
   async function buildState(): Promise<TaskBridgeState> {
     const [
       { tasks, isDemo },
@@ -3746,13 +3823,19 @@ export default function activate(orca: OrcaWorkerApi): void {
 
     // Read workspaces & live agents to cross-reference with in-flight tickets (Fleet View)
     let workspaces: HostWorkspaceEntry[] = []
-    try {
-      const wsRes = await orca.host.call('workspace.list')
-      if (Array.isArray(wsRes?.workspaces)) {
-        workspaces = wsRes.workspaces
+    if (startupWorkspaceListPromise) {
+      const pendingStartup = startupWorkspaceListPromise
+      startupWorkspaceListPromise = null
+      workspaces = await pendingStartup
+    } else {
+      try {
+        const wsRes = await orca.host.call('workspace.list')
+        if (Array.isArray(wsRes?.workspaces)) {
+          workspaces = wsRes.workspaces
+        }
+      } catch {
+        // Ignore if unavailable
       }
-    } catch {
-      // Ignore if unavailable
     }
 
     if (activeBranch || activeWorkspaceName) {
@@ -3972,8 +4055,17 @@ export default function activate(orca: OrcaWorkerApi): void {
     const usingDemoData =
       isDemo && !cachedLinearConnected && cachedJiraSites.length === 0 && !notionConfigured
 
-    const activeSprint =
-      [...tasks, ...cachedUnassignedSprintTasks].find((t) => Boolean(t.sprint))?.sprint ?? null
+    const activeSprintsMap = new Map<string, SprintInfo>()
+    for (const t of [...tasks, ...cachedUnassignedSprintTasks]) {
+      if (t.sprint?.name) {
+        const key = t.sprint.name.toLowerCase()
+        if (!activeSprintsMap.has(key)) {
+          activeSprintsMap.set(key, t.sprint)
+        }
+      }
+    }
+    const activeSprints = Array.from(activeSprintsMap.values())
+    const activeSprint = activeSprints[0] ?? null
     const cachedTasksMayBeStale =
       !usingDemoData &&
       (cachedJiraSyncStatus === 'auth_warning' || tasks.some((t) => Boolean(t.staleFromFailedSync)))
@@ -4025,6 +4117,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       syncTotalCount: cachedSyncTotalCount,
       sprintJql: cfg.sprintJql,
       activeSprint,
+      activeSprints,
       unassignedSprintTasks: cachedUnassignedSprintTasks,
       defaultJiraProject: cfg.defaultJiraProject,
       defaultJiraIssueType: cfg.defaultJiraIssueType,
@@ -4919,6 +5012,131 @@ export default function activate(orca: OrcaWorkerApi): void {
 
   let syncInProgress = false
 
+  async function refreshJiraSitesFromCli(signal?: AbortSignal): Promise<JiraSiteConnection[]> {
+    const connAns = await runOrcaCli(['jira', 'connection'], signal)
+    if (connAns?.ok === true && connAns.result && typeof connAns.result === 'object') {
+      const resObj = connAns.result as Record<string, unknown>
+      if (Array.isArray(resObj.sites)) {
+        cachedJiraSites = resObj.sites
+          .filter((s): s is Record<string, unknown> => Boolean(s && typeof s === 'object'))
+          .map((s) => {
+            const userObj =
+              s.user && typeof s.user === 'object' ? (s.user as Record<string, unknown>) : null
+            const accountId = sanitizeUntrustedText(
+              String(s.accountId ?? userObj?.accountId ?? ''),
+              120
+            )
+            const displayName = sanitizeUntrustedText(
+              String(s.displayName ?? userObj?.displayName ?? userObj?.name ?? ''),
+              80
+            )
+            return {
+              id: sanitizeUntrustedText(String(s.id ?? ''), 120),
+              siteUrl: validateHttpsUrl(String(s.siteUrl ?? '')) ?? '',
+              email: sanitizeUntrustedText(String(s.email ?? userObj?.email ?? ''), 120),
+              ...(accountId ? { accountId } : {}),
+              ...(displayName ? { displayName } : {})
+            }
+          })
+          .filter((s) => Boolean(s.id))
+        const activeFromCli = sanitizeUntrustedText(
+          String(resObj.selectedSiteId ?? resObj.activeSiteId ?? ''),
+          120
+        )
+        if (!cachedSelectedJiraSiteId) {
+          cachedSelectedJiraSiteId =
+            cachedJiraSites.find((s) => s.id === activeFromCli)?.id ??
+            cachedJiraSites[0]?.id ??
+            null
+        }
+      }
+    }
+    return cachedJiraSites
+  }
+
+  async function resolveCurrentUserJiraAssignee(
+    siteId: string | null,
+    safeKey: string,
+    signal?: AbortSignal
+  ): Promise<{ accountId: string | null; displayName: string }> {
+    if (cachedJiraSites.length === 0) {
+      await refreshJiraSitesFromCli(signal)
+    }
+    const siteEntry = siteId
+      ? cachedJiraSites.find((s) => s.id === siteId)
+      : cachedJiraSites[0]
+    const siteEmail = (siteEntry?.email ?? '').trim()
+    const fallbackName = siteEntry?.displayName || siteEmail || 'Assigned to me'
+
+    // 1. Prefer `sites[].accountId` directly from `orca jira connection` (no extra CLI lookup needed)
+    if (siteEntry?.accountId) {
+      return {
+        accountId: siteEntry.accountId,
+        displayName: fallbackName
+      }
+    }
+
+    // 2. Otherwise only query `orca jira assignee list` when we have a non-empty user email to filter by
+    if (!siteEmail) {
+      return { accountId: null, displayName: fallbackName }
+    }
+
+    const siteArgs = siteId ? ['--site', siteId] : []
+    const listAns = await runOrcaCli(
+      ['jira', 'assignee', 'list', safeKey, '--query', siteEmail, ...siteArgs],
+      signal
+    )
+    const rawUsers = Array.isArray(listAns?.result)
+      ? listAns.result
+      : listAns?.result && typeof listAns.result === 'object'
+        ? Array.isArray((listAns.result as Record<string, unknown>).users)
+          ? ((listAns.result as Record<string, unknown>).users as unknown[])
+          : Array.isArray((listAns.result as Record<string, unknown>).assignees)
+            ? ((listAns.result as Record<string, unknown>).assignees as unknown[])
+            : Array.isArray((listAns.result as Record<string, unknown>).items)
+              ? ((listAns.result as Record<string, unknown>).items as unknown[])
+              : []
+        : []
+
+    const validUsers = rawUsers.filter(
+      (u): u is Record<string, unknown> =>
+        Boolean(
+          u &&
+            typeof u === 'object' &&
+            ((u as Record<string, unknown>).accountId || (u as Record<string, unknown>).id)
+        )
+    )
+
+    // Match strictly by email, or accept the single returned user when `--query <email>` narrowed to 1 result
+    const exactEmailUser = validUsers.find(
+      (u) =>
+        String(u.emailAddress ?? u.email ?? '')
+          .trim()
+          .toLowerCase() === siteEmail.toLowerCase()
+    )
+    const matchedUser = exactEmailUser ?? (validUsers.length === 1 ? validUsers[0] : undefined)
+    if (!matchedUser) {
+      return { accountId: null, displayName: fallbackName }
+    }
+
+    const accountId = sanitizeUntrustedText(
+      String(matchedUser.accountId ?? matchedUser.id ?? ''),
+      120
+    )
+    const displayName =
+      sanitizeUntrustedText(
+        String(
+          matchedUser.displayName ??
+            matchedUser.name ??
+            matchedUser.emailAddress ??
+            matchedUser.email ??
+            ''
+        ),
+        80
+      ) || fallbackName
+    return { accountId: accountId || null, displayName }
+  }
+
   async function performSync(
     input?: { provider?: string; scope?: string; jiraSiteId?: string },
     signal?: AbortSignal
@@ -4944,30 +5162,7 @@ export default function activate(orca: OrcaWorkerApi): void {
 
     // 1. Discover connected Jira sites AND fetch Jira issues via `orca jira list` / `orca jira search`
     if (providerFilter === 'all' || providerFilter === 'jira') {
-      const connAns = await runOrcaCli(['jira', 'connection'], signal)
-      if (connAns?.ok === true && connAns.result && typeof connAns.result === 'object') {
-        const resObj = connAns.result as Record<string, unknown>
-        if (Array.isArray(resObj.sites)) {
-          cachedJiraSites = resObj.sites
-            .filter((s): s is Record<string, unknown> => Boolean(s && typeof s === 'object'))
-            .map((s) => ({
-              id: sanitizeUntrustedText(String(s.id ?? ''), 120),
-              siteUrl: validateHttpsUrl(String(s.siteUrl ?? '')) ?? '',
-              email: sanitizeUntrustedText(String(s.email ?? ''), 120)
-            }))
-            .filter((s) => Boolean(s.id))
-          const activeFromCli = sanitizeUntrustedText(
-            String(resObj.selectedSiteId ?? resObj.activeSiteId ?? ''),
-            120
-          )
-          if (!cachedSelectedJiraSiteId) {
-            cachedSelectedJiraSiteId =
-              cachedJiraSites.find((s) => s.id === activeFromCli)?.id ??
-              cachedJiraSites[0]?.id ??
-              null
-          }
-        }
-      }
+      await refreshJiraSitesFromCli(signal)
 
       if (cachedSelectedJiraSiteId) {
         const jiraRes = await fetchJiraTasksWithHierarchy(
@@ -5058,6 +5253,7 @@ export default function activate(orca: OrcaWorkerApi): void {
           'acVerificationSummary',
           'acReviewerTerminalId',
           'acProposerTerminalId',
+          'proposedAcceptanceCriteria',
           'repoId',
           'planApproved',
           'planLockActive',
@@ -6272,7 +6468,9 @@ export default function activate(orca: OrcaWorkerApi): void {
       const updatedTask =
         (await patchTaskLocked(task.id, (current) => ({
           ...current,
-          ...(immediateProposed.length > 0 ? { acceptanceCriteria: immediateProposed } : {}),
+          ...(immediateProposed.length > 0
+            ? { proposedAcceptanceCriteria: immediateProposed }
+            : {}),
           ...(proposerTerminalId ? { acProposerTerminalId: proposerTerminalId } : {}),
           updatedAt: Date.now()
         }))) ?? task
@@ -6290,13 +6488,52 @@ export default function activate(orca: OrcaWorkerApi): void {
           immediateProposed.length > 0
             ? `Proposed ${immediateProposed.length} acceptance criteria for [${task.key}]${
                 commentPosted ? ' and posted as a ticket comment' : ''
-              }.`
-            : `Launched read-only AC Proposer agent (${proposerAgent}) for [${task.key}]. Criteria will be posted as a comment when the agent finishes.`
+              }. Click Accept Proposed AC in Workbench to adopt them.`
+            : `Launched read-only AC Proposer agent (${proposerAgent}) for [${task.key}]. Criteria will be posted as a comment and staged for approval when the agent finishes.`
       }
     }
   )
 
-  // Item 8 (0.3.0): Assign an unassigned sprint ticket to the current user via `orca jira assignee set`
+  orca.panels.handle(
+    'tasks.acceptProposedAc',
+    async (input: AcceptProposedAcInput): Promise<AcceptProposedAcOutput> => {
+      const { tasks } = await readEffectiveTasks()
+      const task = tasks.find((t) => t.id === input.taskId)
+      if (!task) {
+        const err = new Error(`Task not found: ${input.taskId}`) as Error & { code: string }
+        err.code = 'invalid_params'
+        throw err
+      }
+      const proposed = task.proposedAcceptanceCriteria ?? []
+      if (proposed.length === 0) {
+        const err = new Error(`No proposed Acceptance Criteria pending for [${task.key}].`) as Error & {
+          code: string
+        }
+        err.code = 'invalid_params'
+        throw err
+      }
+
+      const updatedTask =
+        (await patchTaskLocked(task.id, (current) => {
+          const next: TaskItem = {
+            ...current,
+            acceptanceCriteria: [...(current.proposedAcceptanceCriteria ?? proposed)],
+            updatedAt: Date.now()
+          }
+          delete next.proposedAcceptanceCriteria
+          return next
+        })) ?? task
+
+      const state = await broadcastState()
+      return {
+        state,
+        acceptanceCriteria: updatedTask.acceptanceCriteria,
+        summary: `Accepted ${updatedTask.acceptanceCriteria.length} proposed Acceptance Criteria for [${task.key}].`
+      }
+    }
+  )
+
+  // Assign an unassigned sprint ticket to the current user via `orca jira assignee set`
   orca.panels.handle(
     'tasks.assignToMe',
     async (input: AssignToMeInput, { signal }): Promise<AssignToMeOutput> => {
@@ -6318,57 +6555,18 @@ export default function activate(orca: OrcaWorkerApi): void {
       }
 
       const siteId = task.externalWorkspaceId || cachedSelectedJiraSiteId || null
-      const siteEntry = siteId
-        ? cachedJiraSites.find((s) => s.id === siteId)
-        : cachedJiraSites[0]
-      const siteEmail = siteEntry?.email ?? ''
-      let resolvedAssigneeName = siteEmail || 'Assigned to me'
+      let resolvedAssigneeName = 'Assigned to me'
       let assignedOnProvider = false
 
       if (task.demo) {
         assignedOnProvider = true
       } else if (task.provider === 'jira') {
         const siteArgs = siteId ? ['--site', siteId] : []
-        const listArgs = ['jira', 'assignee', 'list', safeKey]
-        if (siteEmail) listArgs.push('--query', siteEmail)
-        listArgs.push(...siteArgs)
-        const listAns = await runOrcaCli(listArgs, signal)
-        const rawUsers = Array.isArray(listAns?.result)
-          ? listAns.result
-          : listAns?.result && typeof listAns.result === 'object'
-            ? Array.isArray((listAns.result as Record<string, unknown>).users)
-              ? ((listAns.result as Record<string, unknown>).users as unknown[])
-              : Array.isArray((listAns.result as Record<string, unknown>).assignees)
-                ? ((listAns.result as Record<string, unknown>).assignees as unknown[])
-                : Array.isArray((listAns.result as Record<string, unknown>).items)
-                  ? ((listAns.result as Record<string, unknown>).items as unknown[])
-                  : []
-            : []
-
-        let accountId = ''
-        for (const u of rawUsers) {
-          if (!u || typeof u !== 'object') continue
-          const uObj = u as Record<string, unknown>
-          const candId = sanitizeUntrustedText(
-            String(uObj.accountId ?? uObj.id ?? ''),
-            120
-          )
-          if (!candId) continue
-          const candName = sanitizeUntrustedText(
-            String(uObj.displayName ?? uObj.name ?? uObj.emailAddress ?? uObj.email ?? ''),
-            80
-          )
-          const candEmail = String(uObj.emailAddress ?? uObj.email ?? '').toLowerCase()
-          if (!accountId || (siteEmail && candEmail === siteEmail.toLowerCase())) {
-            accountId = candId
-            if (candName) resolvedAssigneeName = candName
-            if (siteEmail && candEmail === siteEmail.toLowerCase()) break
-          }
-        }
-
-        if (accountId) {
+        const resolved = await resolveCurrentUserJiraAssignee(siteId, safeKey, signal)
+        resolvedAssigneeName = resolved.displayName
+        if (resolved.accountId) {
           const setAns = await runOrcaCli(
-            ['jira', 'assignee', 'set', safeKey, '--to-id', accountId, ...siteArgs],
+            ['jira', 'assignee', 'set', safeKey, '--to-id', resolved.accountId, ...siteArgs],
             signal
           )
           assignedOnProvider = setAns?.ok === true
@@ -6615,48 +6813,29 @@ export default function activate(orca: OrcaWorkerApi): void {
         typeof createAns.result === 'object' && !Array.isArray(createAns.result)
           ? (createAns.result as Record<string, unknown>)
           : null
-      const createdKey =
-        validateTicketKey(String(resObj?.key ?? '')) ?? `${projectKey}-1`
+      const createdKey = validateTicketKey(String(resObj?.key ?? ''))
+      if (!createdKey) {
+        const err = new Error(
+          `Jira create did not return a valid issue key in project ${projectKey}.`
+        ) as Error & { code: string }
+        err.code = 'action_failed'
+        throw err
+      }
       const createdUrl = validateHttpsUrl(typeof resObj?.url === 'string' ? resObj.url : undefined)
 
-      // Best-effort auto-assign to current user via `orca jira assignee list` + `orca jira assignee set`
-      const siteEntry = siteId
-        ? cachedJiraSites.find((s) => s.id === siteId)
-        : cachedJiraSites[0]
-      const siteEmail = siteEntry?.email ?? ''
-      let assigneeName = siteEmail || 'Assigned to me'
-
-      const assignListArgs = ['jira', 'assignee', 'list', createdKey]
-      if (siteEmail) assignListArgs.push('--query', siteEmail)
-      assignListArgs.push(...siteArgs)
-      const assignListAns = await runOrcaCli(assignListArgs, signal)
-      const rawUsers = Array.isArray(assignListAns?.result)
-        ? assignListAns.result
-        : assignListAns?.result && typeof assignListAns.result === 'object'
-          ? Array.isArray((assignListAns.result as Record<string, unknown>).users)
-            ? ((assignListAns.result as Record<string, unknown>).users as unknown[])
-            : []
-          : []
-      const firstUser = rawUsers.find(
-        (u): u is Record<string, unknown> =>
-          Boolean(u && typeof u === 'object' && ((u as Record<string, unknown>).accountId || (u as Record<string, unknown>).id))
-      )
-      if (firstUser) {
-        const accountId = sanitizeUntrustedText(
-          String(firstUser.accountId ?? firstUser.id ?? ''),
-          120
+      // Auto-assign to current user using `sites[].accountId` from `orca jira connection` (or email query fallback)
+      const resolvedUser = await resolveCurrentUserJiraAssignee(siteId, createdKey, signal)
+      let assigneeName = resolvedUser.displayName
+      if (resolvedUser.accountId) {
+        const setAns = await runOrcaCli(
+          ['jira', 'assignee', 'set', createdKey, '--to-id', resolvedUser.accountId, ...siteArgs],
+          signal
         )
-        const displayName = sanitizeUntrustedText(
-          String(firstUser.displayName ?? firstUser.name ?? assigneeName),
-          80
-        )
-        if (accountId) {
-          await runOrcaCli(
-            ['jira', 'assignee', 'set', createdKey, '--to-id', accountId, ...siteArgs],
-            signal
-          )
-          if (displayName) assigneeName = displayName
+        if (setAns?.ok !== true) {
+          assigneeName = 'Unassigned'
         }
+      } else {
+        assigneeName = 'Unassigned'
       }
 
       const createdTask: TaskItem = {
@@ -6991,7 +7170,7 @@ export default function activate(orca: OrcaWorkerApi): void {
           })
           await patchTaskLocked(propTask.id, (current) => ({
             ...current,
-            acceptanceCriteria: proposedCriteria,
+            proposedAcceptanceCriteria: proposedCriteria,
             updatedAt: Date.now()
           }))
         }
@@ -7091,14 +7270,40 @@ export default function activate(orca: OrcaWorkerApi): void {
     await broadcastState()
   })
 
-  // Hydrate lookup maps and wait for initial workspace.changed replay scan so hooks have zero I/O (0.2.1 #1)
-  const initLookupPromise = Promise.all([
-    readStoredTasks().then((stored) => {
-      if (stored.length > 0 && taskByTerminalId.size === 0 && taskByWorkspaceId.size === 0) {
-        rebuildLookupMaps(stored)
+  // Scan open repositories immediately on activation AND bound `initLookupPromise` with a 400ms race
+  // so `agent.tool.before` never times out even if `workspace.changed` is not emitted on startup
+  async function primeInitialRepoConfigs(): Promise<void> {
+    try {
+      const workspaces = await fetchStartupWorkspacesOnce()
+      for (const ws of workspaces) {
+        const repoId = extractRepoId(ws.id) ?? ws.id
+        if (!repoId || cachedRepoConfigsByRepoId.has(repoId)) continue
+        scanRepoConfigAndSkills(repoId, ws.path)
       }
-    }),
-    initialWorkspaceScanPromise
+    } catch {
+      // Ignore if workspace.list is unavailable
+    } finally {
+      resolveInitialWorkspaceScan?.()
+      resolveInitialWorkspaceScan = null
+    }
+  }
+
+  const startupTimeoutPromise = new Promise<void>((resolve) => {
+    const t = setTimeout(resolve, 400)
+    t.unref?.()
+  })
+
+  const initLookupPromise = Promise.race([
+    Promise.all([
+      readStoredTasks().then((stored) => {
+        if (stored.length > 0 && taskByTerminalId.size === 0 && taskByWorkspaceId.size === 0) {
+          rebuildLookupMaps(stored)
+        }
+      }),
+      primeInitialRepoConfigs(),
+      initialWorkspaceScanPromise
+    ]),
+    startupTimeoutPromise
   ]).catch(() => undefined)
 
   // Fixes Bug #5 & Bug #10: Correlate `agent.prompt.before` strictly by `terminalId`

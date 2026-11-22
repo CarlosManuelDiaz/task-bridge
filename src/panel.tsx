@@ -579,6 +579,16 @@ async function handleProposeAc(taskId: string): Promise<void> {
   }
 }
 
+async function handleAcceptProposedAc(taskId: string): Promise<void> {
+  try {
+    const res = await plugin.request('tasks.acceptProposedAc', { taskId })
+    applyIncomingState(res.state)
+    set(statusMessage, { text: res.summary, tone: 'success' })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
+}
+
 async function handleAssignToMe(taskId: string): Promise<void> {
   try {
     const res = await plugin.request('tasks.assignToMe', { taskId })
@@ -918,7 +928,12 @@ export default function Panel() {
       ) : null}
 
       {state.jiraAuthWarning ? (
-        <Callout tone="warning" title="Jira Connection Warning">
+        <Callout
+          tone={state.jiraSyncStatus === 'error' ? 'danger' : 'warning'}
+          title={
+            state.jiraSyncStatus === 'error' ? 'Jira Query Error' : 'Jira Connection Warning'
+          }
+        >
           <Text size="xs">{state.jiraAuthWarning}</Text>
         </Callout>
       ) : null}
@@ -966,28 +981,41 @@ export default function Panel() {
               </Callout>
             ) : null}
 
-            {state.scope === 'sprint' && state.activeSprint ? (
-              <Card
-                title={`Sprint: ${state.activeSprint.name}`}
-                description={state.activeSprint.goal || 'Active sprint / cycle'}
-              >
-                <Stack gap="xs">
+            {state.scope === 'sprint' &&
+            ((state.activeSprints?.length ?? 0) > 0 || state.activeSprint) ? (
+              (state.activeSprints?.length ?? 0) > 1 ? (
+                <Card
+                  title={`Open Sprints (${state.activeSprints!.length})`}
+                  description="Tickets grouped across active sprints"
+                >
                   <Row gap="xs" wrap>
-                    <Badge tone={state.activeSprint.isOverdue ? 'warning' : 'accent'}>
-                      {state.activeSprint.isOverdue
-                        ? `Ended ${state.activeSprint.overdueDays ?? 1}d ago (still open)`
-                        : typeof state.activeSprint.daysRemaining === 'number'
-                          ? `${state.activeSprint.daysRemaining}d remaining`
-                          : state.activeSprint.state || 'Active'}
-                    </Badge>
-                    {state.activeSprint.startDate || state.activeSprint.endDate ? (
-                      <Text muted size="xs">
-                        {`${state.activeSprint.startDate?.slice(0, 10) ?? '—'} → ${state.activeSprint.endDate?.slice(0, 10) ?? '—'}`}
-                      </Text>
-                    ) : null}
+                    {state.activeSprints!.map((sp) => {
+                      const count = filteredTasks.filter(
+                        (t) => t.sprint?.name?.toLowerCase() === sp.name.toLowerCase()
+                      ).length
+                      return (
+                        <Badge key={sp.name} tone="accent">
+                          {`${sp.name} (${count})`}
+                        </Badge>
+                      )
+                    })}
                   </Row>
-                </Stack>
-              </Card>
+                </Card>
+              ) : (
+                <Card
+                  title={`Sprint: ${(state.activeSprints?.[0] ?? state.activeSprint)!.name}`}
+                  description={
+                    (state.activeSprints?.[0] ?? state.activeSprint)!.goal ||
+                    `${filteredTasks.length} ticket${filteredTasks.length === 1 ? '' : 's'} in active sprint`
+                  }
+                >
+                  <Row gap="xs" wrap>
+                    <Badge tone="accent">
+                      {(state.activeSprints?.[0] ?? state.activeSprint)!.state || 'Active'}
+                    </Badge>
+                  </Row>
+                </Card>
+              )
             ) : null}
 
             <Row gap="xs">
@@ -1040,7 +1068,7 @@ export default function Panel() {
                 ) : null}
                 {state.syncTruncated ? (
                   <Badge tone="neutral">
-                    {`Showing ${filteredTasks.length} of ${state.syncTotalCount ?? `${state.syncLimit ?? 100}+`}`}
+                    {`Showing ${filteredTasks.length} (limit reached)`}
                   </Badge>
                 ) : null}
               </Row>
@@ -1099,7 +1127,14 @@ export default function Panel() {
               />
             ) : (
               <Stack gap="sm">
-                {filteredTasks.map((task) => {
+                {filteredTasks.map((task, idx) => {
+                  const prevSprintName = idx > 0 ? (filteredTasks[idx - 1]?.sprint?.name ?? '') : ''
+                  const curSprintName = task.sprint?.name ?? ''
+                  const showSprintGroupHeader =
+                    state.scope === 'sprint' &&
+                    (state.activeSprints?.length ?? 0) > 1 &&
+                    Boolean(curSprintName) &&
+                    curSprintName !== prevSprintName
                   const taskRepo = resolveTaskRepoInfo(state, task)
                   const autoBranch =
                     task.linkedBranch ??
@@ -1108,115 +1143,134 @@ export default function Panel() {
                       getBranchNamingConfig(state, taskRepo.repoId ?? state.activeRepoId ?? undefined)
                     )
                   return (
-                    <Card
-                      key={task.id}
-                      title={`${task.key} · ${task.title}`}
-                      description={task.description || 'No description provided.'}
-                    >
-                      <Stack gap="xs">
-                        {task.parent ? (
-                          <Text muted size="xs">
-                            Parent: <Code>{task.parent.key}</Code> {task.parent.title}
+                    <Stack key={task.id} gap="xs">
+                      {showSprintGroupHeader ? (
+                        <Row justify="between" align="center">
+                          <Text size="xs" weight="medium">
+                            {`Sprint: ${curSprintName}`}
                           </Text>
-                        ) : null}
-
-                        <Row gap="xs" wrap>
-                          <Badge tone={providerTone(task.provider)}>
-                            {providerLabel(task.provider)}
+                          <Badge tone="accent">
+                            {`${filteredTasks.filter((t) => t.sprint?.name === curSprintName).length} tickets`}
                           </Badge>
-                          <Badge tone="neutral">{task.issueType || 'Task'}</Badge>
-                          <Badge tone={statusTone(task.statusCategory)}>{task.status}</Badge>
-                          <Badge tone={priorityTone(task.priority)}>{task.priority}</Badge>
-                          {(state.availableRepos?.length ?? 0) > 0 ? (
-                            <Badge tone={taskRepo.isAmbiguous ? 'warning' : 'neutral'}>
-                              {`Repo: ${taskRepo.label}`}
-                            </Badge>
-                          ) : null}
-                          {task.children && task.children.length > 0 ? (
-                            <Badge tone="neutral">{`${task.children.length} subtasks`}</Badge>
-                          ) : null}
-                          {task.agentState && task.agentState !== 'idle' ? (
-                            <Badge tone={agentStateTone(task.agentState)}>
-                              {`${task.dispatchedAgent ?? state.defaultAgent}: ${task.agentState}`}
-                            </Badge>
-                          ) : null}
-                          {task.planLockActive && !task.planApproved ? (
-                            <Badge tone="warning">Plan Lock</Badge>
-                          ) : task.planApproved ? (
-                            <Badge tone="success">Plan Approved</Badge>
-                          ) : null}
-                          {(task.unreadCommentsCount ?? 0) > 0 ? (
-                            <Badge tone="warning">{`${task.unreadCommentsCount} new comments`}</Badge>
-                          ) : null}
-                          {!task.description.trim() ? (
-                            <Badge tone="warning">No Description</Badge>
-                          ) : null}
-                          {task.acceptanceCriteria.length === 0 ? (
-                            <Badge tone="warning">Missing AC</Badge>
-                          ) : null}
-                          {task.staleFromFailedSync ? (
-                            <Badge tone="warning">Outdated</Badge>
-                          ) : null}
                         </Row>
+                      ) : null}
+                      <Card
+                        title={`${task.key} · ${task.title}`}
+                        description={task.description || 'No description provided.'}
+                      >
+                        <Stack gap="xs">
+                          {task.parent ? (
+                            <Text muted size="xs">
+                              Parent: <Code>{task.parent.key}</Code> {task.parent.title}
+                            </Text>
+                          ) : null}
 
-                        <Text muted size="xs">
-                          Assignee: {task.assignee || 'Unassigned'} · Branch:{' '}
-                          <Code>{autoBranch}</Code>
-                        </Text>
+                          <Row gap="xs" wrap>
+                            <Badge tone={providerTone(task.provider)}>
+                              {providerLabel(task.provider)}
+                            </Badge>
+                            {task.sprint?.name ? (
+                              <Badge tone="accent">{task.sprint.name}</Badge>
+                            ) : null}
+                            <Badge tone="neutral">{task.issueType || 'Task'}</Badge>
+                            <Badge tone={statusTone(task.statusCategory)}>{task.status}</Badge>
+                            <Badge tone={priorityTone(task.priority)}>{task.priority}</Badge>
+                            {(state.availableRepos?.length ?? 0) > 0 ? (
+                              <Badge tone={taskRepo.isAmbiguous ? 'warning' : 'neutral'}>
+                                {`Repo: ${taskRepo.label}`}
+                              </Badge>
+                            ) : null}
+                            {task.children && task.children.length > 0 ? (
+                              <Badge tone="neutral">{`${task.children.length} subtasks`}</Badge>
+                            ) : null}
+                            {task.agentState && task.agentState !== 'idle' ? (
+                              <Badge tone={agentStateTone(task.agentState)}>
+                                {`${task.dispatchedAgent ?? state.defaultAgent}: ${task.agentState}`}
+                              </Badge>
+                            ) : null}
+                            {task.planLockActive && !task.planApproved ? (
+                              <Badge tone="warning">Plan Lock</Badge>
+                            ) : task.planApproved ? (
+                              <Badge tone="success">Plan Approved</Badge>
+                            ) : null}
+                            {(task.unreadCommentsCount ?? 0) > 0 ? (
+                              <Badge tone="warning">{`${task.unreadCommentsCount} new comments`}</Badge>
+                            ) : null}
+                            {!task.description.trim() ? (
+                              <Badge tone="warning">No Description</Badge>
+                            ) : null}
+                            {task.acceptanceCriteria.length === 0 ? (
+                              <Badge tone="warning">Missing AC</Badge>
+                            ) : null}
+                            {(task.proposedAcceptanceCriteria?.length ?? 0) > 0 ? (
+                              <Badge tone="accent">
+                                {`${task.proposedAcceptanceCriteria!.length} Proposed AC`}
+                              </Badge>
+                            ) : null}
+                            {task.staleFromFailedSync ? (
+                              <Badge tone="warning">Outdated</Badge>
+                            ) : null}
+                          </Row>
 
-                        <Row gap="xs" wrap>
-                          <Button
-                            size="xs"
-                            variant="solid"
-                            tone="accent"
-                            icon="play"
-                            onPress={() => handleQuickDispatch(task)}
-                          >
-                            {`Start ${task.key}`}
-                          </Button>
-                          {task.planLockActive && !task.planApproved ? (
+                          <Text muted size="xs">
+                            Assignee: {task.assignee || 'Unassigned'} · Branch:{' '}
+                            <Code>{autoBranch}</Code>
+                          </Text>
+
+                          <Row gap="xs" wrap>
                             <Button
                               size="xs"
                               variant="solid"
-                              tone="warning"
-                              icon="check"
-                              onPress={() => handleApprovePlan(task.id)}
+                              tone="accent"
+                              icon="play"
+                              onPress={() => handleQuickDispatch(task)}
                             >
-                              {`Approve Plan ${task.key}`}
+                              {`Start ${task.key}`}
                             </Button>
-                          ) : null}
-                          {task.linkedOrcaWorkspaceId ? (
+                            {task.planLockActive && !task.planApproved ? (
+                              <Button
+                                size="xs"
+                                variant="solid"
+                                tone="warning"
+                                icon="check"
+                                onPress={() => handleApprovePlan(task.id)}
+                              >
+                                {`Approve Plan ${task.key}`}
+                              </Button>
+                            ) : null}
+                            {task.linkedOrcaWorkspaceId ? (
+                              <Button
+                                size="xs"
+                                variant="outline"
+                                icon="folder"
+                                onPress={() => handleOpenWorkspace(task.id)}
+                              >
+                                {`Open ${task.key}`}
+                              </Button>
+                            ) : null}
                             <Button
                               size="xs"
                               variant="outline"
-                              icon="folder"
-                              onPress={() => handleOpenWorkspace(task.id)}
+                              icon="code"
+                              onPress={() => openTaskInWorkbench(task.id)}
                             >
-                              {`Open ${task.key}`}
+                              {`Configure ${task.key}`}
                             </Button>
-                          ) : null}
-                          <Button
-                            size="xs"
-                            variant="outline"
-                            icon="code"
-                            onPress={() => openTaskInWorkbench(task.id)}
-                          >
-                            {`Configure ${task.key}`}
-                          </Button>
-                          {task.statusCategory !== 'in_review' &&
-                          task.statusCategory !== 'done' ? (
-                            <Button
-                              size="xs"
-                              variant="ghost"
-                              icon="check"
-                              onPress={() => handleTransition(task.id, 'in_review')}
-                            >
-                              {`Review ${task.key}`}
-                            </Button>
-                          ) : null}
-                        </Row>
-                      </Stack>
-                    </Card>
+                            {task.statusCategory !== 'in_review' &&
+                            task.statusCategory !== 'done' ? (
+                              <Button
+                                size="xs"
+                                variant="ghost"
+                                icon="check"
+                                onPress={() => handleTransition(task.id, 'in_review')}
+                              >
+                                {`Review ${task.key}`}
+                              </Button>
+                            ) : null}
+                          </Row>
+                        </Stack>
+                      </Card>
+                    </Stack>
                   )
                 })}
               </Stack>
@@ -1561,6 +1615,30 @@ export default function Panel() {
                           onPress={() => handleProposeAc(selectedTask.id)}
                         >
                           Propose AC
+                        </Button>
+                      </Stack>
+                    </Callout>
+                  ) : null}
+
+                  {(selectedTask.proposedAcceptanceCriteria?.length ?? 0) > 0 ? (
+                    <Callout
+                      tone="accent"
+                      title={`Proposed Acceptance Criteria (${selectedTask.proposedAcceptanceCriteria!.length})`}
+                    >
+                      <Stack gap="xs">
+                        {selectedTask.proposedAcceptanceCriteria!.map((crit, idx) => (
+                          <Text key={idx} size="xs">
+                            {`• ${crit}`}
+                          </Text>
+                        ))}
+                        <Button
+                          size="xs"
+                          variant="solid"
+                          tone="accent"
+                          icon="check"
+                          onPress={() => handleAcceptProposedAc(selectedTask.id)}
+                        >
+                          Accept Proposed AC
                         </Button>
                       </Stack>
                     </Callout>
