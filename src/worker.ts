@@ -8,6 +8,7 @@ import {
   buildAcVerificationPrompt,
   buildAgentPrompt,
   buildBranchName,
+  buildProposeAcPrompt,
   type AcVerificationStatus,
   type AddManualTaskInput,
   type AgentAvailability,
@@ -16,14 +17,20 @@ import {
   type ApproveRepoSetupInput,
   type ApproveRepoSetupOutput,
   type AssignTaskRepoInput,
+  type AssignToMeInput,
+  type AssignToMeOutput,
   type AvailableRepo,
   type BranchNamingConfig,
   type BranchTypeRule,
   type CleanupWorktreeInput,
   type CleanupWorktreeOutput,
+  type CreateFromWorkspaceInput,
+  type CreateFromWorkspaceOutput,
   type DetectPrInput,
   type DetectPrOutput,
   type DiscoveredSkill,
+  type DiscoverJiraMetadataInput,
+  type DiscoverJiraMetadataOutput,
   type DismissFleetInput,
   type DismissFleetOutput,
   type DispatchChildrenInput,
@@ -31,12 +38,16 @@ import {
   type DispatchTaskInput,
   type DispatchTaskOutput,
   type FleetItem,
+  type JiraIssueTypeOption,
+  type JiraProjectOption,
   type JiraSiteConnection,
   type LinkedWorkspaceInfo,
   type LiveAgentState,
   type OpenWorkspaceInput,
   type OpenWorkspaceOutput,
   type PlanApprovalStatus,
+  type ProposeAcInput,
+  type ProposeAcOutput,
   type QueryChildrenInput,
   type QueryChildrenOutput,
   type RepoConfigFile,
@@ -50,6 +61,7 @@ import {
   type SendCommentFeedbackOutput,
   type SendPrFeedbackInput,
   type SendPrFeedbackOutput,
+  type SprintInfo,
   type StatusAliasesConfig,
   type TaskBridgeState,
   type TaskChildItem,
@@ -68,6 +80,7 @@ import {
   findDeniedGitWriteInToolCall,
   isAcReviewerVerdictWrite,
   isPlanLockToolAllowed,
+  isProposedAcFileWrite,
   parseWorktreeSetupCommand,
   redactSecrets,
   sanitizeBranchPrefix,
@@ -85,11 +98,12 @@ const STORAGE_TASKS_KEY = 'tasks'
 const STORAGE_SCOPE_KEY = 'scope'
 const STORAGE_ACTIVE_TASK_KEY = 'activeTaskId'
 const STORAGE_LAST_SYNCED_KEY = 'lastSyncedAt'
+const STORAGE_LAST_SYNCED_WITH_DATA_KEY = 'lastSyncedWithDataAt'
 const STORAGE_REPO_PROFILES_KEY = 'repoProfiles'
 const STORAGE_APPROVED_SETUP_HASHES_KEY = 'approvedRepoSetupHashes'
 const SECRET_NOTION_TOKEN = 'notionToken'
 
-const VALID_SCOPES = new Set<TaskScopeFilter>(['assigned', 'reported', 'all', 'done'])
+const VALID_SCOPES = new Set<TaskScopeFilter>(['assigned', 'sprint', 'reported', 'all', 'done'])
 
 export const DEFAULT_SEED_TASKS: TaskItem[] = [
   {
@@ -348,7 +362,105 @@ function mapPriority(raw: unknown): TaskPriority {
   return 'medium'
 }
 
-export const PLUGIN_VERSION = '0.1.1'
+export const PLUGIN_VERSION = '0.3.0'
+
+/**
+ * Extracts structured Sprint / Cycle metadata from a Jira or Linear issue payload.
+ */
+export function extractSprintInfo(
+  row: Record<string, unknown>,
+  provider: 'jira' | 'linear',
+  nowMs = Date.now()
+): SprintInfo | null {
+  const fieldsObj =
+    row.fields && typeof row.fields === 'object' && !Array.isArray(row.fields)
+      ? (row.fields as Record<string, unknown>)
+      : null
+
+  let rawSprint: unknown =
+    row.sprint ??
+    row.activeSprint ??
+    row.cycle ??
+    fieldsObj?.sprint ??
+    fieldsObj?.closedSprints ??
+    row.sprints ??
+    fieldsObj?.sprints
+
+  if (Array.isArray(rawSprint)) {
+    const activeEntry = rawSprint.find(
+      (s) =>
+        s &&
+        typeof s === 'object' &&
+        String((s as Record<string, unknown>).state ?? '').toLowerCase() === 'active'
+    )
+    rawSprint = activeEntry ?? rawSprint[rawSprint.length - 1]
+  }
+
+  if (!rawSprint || typeof rawSprint !== 'object' || Array.isArray(rawSprint)) {
+    return null
+  }
+
+  const sObj = rawSprint as Record<string, unknown>
+  const rawName = String(
+    sObj.name ??
+      sObj.title ??
+      (typeof sObj.number === 'number' ? `Cycle #${sObj.number}` : '')
+  ).trim()
+  if (!rawName) return null
+
+  const name = sanitizeUntrustedText(rawName, 120)
+  const id = sObj.id != null ? sanitizeUntrustedText(String(sObj.id), 60) : undefined
+  const goal =
+    typeof sObj.goal === 'string' && sObj.goal.trim()
+      ? sanitizeUntrustedText(sObj.goal, 240)
+      : typeof sObj.description === 'string' && sObj.description.trim()
+        ? sanitizeUntrustedText(sObj.description, 240)
+        : undefined
+  const state =
+    typeof sObj.state === 'string' && sObj.state.trim()
+      ? sanitizeUntrustedText(sObj.state, 40)
+      : 'active'
+  const startDate =
+    typeof (sObj.startDate ?? sObj.startsAt) === 'string'
+      ? sanitizeUntrustedText(String(sObj.startDate ?? sObj.startsAt), 40)
+      : undefined
+  const endDate =
+    typeof (sObj.endDate ?? sObj.endsAt) === 'string'
+      ? sanitizeUntrustedText(String(sObj.endDate ?? sObj.endsAt), 40)
+      : undefined
+
+  let daysRemaining: number | null = null
+  let overdueDays: number | null = null
+  let isOverdue = false
+
+  if (endDate) {
+    const parsedEnd = Date.parse(endDate)
+    if (!Number.isNaN(parsedEnd)) {
+      const diffDays = Math.ceil((parsedEnd - nowMs) / 86_400_000)
+      const isClosedState = /^(closed|completed|done)$/i.test(state)
+      if (diffDays < 0 && !isClosedState) {
+        isOverdue = true
+        overdueDays = Math.abs(diffDays)
+        daysRemaining = 0
+      } else {
+        daysRemaining = Math.max(0, diffDays)
+      }
+    }
+  }
+
+  return {
+    ...(id ? { id } : {}),
+    name,
+    ...(goal ? { goal } : {}),
+    state,
+    ...(startDate ? { startDate } : {}),
+    ...(endDate ? { endDate } : {}),
+    daysRemaining,
+    overdueDays,
+    isOverdue,
+    provider
+  }
+}
 
 export function mapIssueKind(issueType: string, title: string): TaskKind {
   const typeLower = issueType.trim().toLowerCase()
@@ -647,6 +759,7 @@ export function parseLinearTasksResult(result: unknown): TaskItem[] {
         ? (row.workspace as Record<string, unknown>)
         : null
     const externalWorkspaceId = wsObj?.id ? sanitizeUntrustedText(String(wsObj.id), 120) : undefined
+    const sprint = extractSprintInfo(row, 'linear')
 
     items.push({
       id: `linear:${key}`,
@@ -666,6 +779,7 @@ export function parseLinearTasksResult(result: unknown): TaskItem[] {
       reporter,
       parent,
       children,
+      ...(sprint ? { sprint } : {}),
       ...(safeUrl ? { url: safeUrl } : {}),
       ...(externalWorkspaceId ? { externalWorkspaceId } : {}),
       updatedAt: Date.now()
@@ -681,8 +795,15 @@ export function parseLinearTasksResult(result: unknown): TaskItem[] {
  */
 async function fetchLinearTasksWithHierarchy(
   scope: TaskScopeFilter,
-  signal?: AbortSignal
-): Promise<{ connected: boolean; items: TaskItem[] }> {
+  signal?: AbortSignal,
+  syncLimit = 100
+): Promise<{
+  connected: boolean
+  items: TaskItem[]
+  truncated: boolean
+  totalCount: number | null
+}> {
+  const safeLimit = String(Math.min(Math.max(syncLimit, 10), 500))
   const linearFilter =
     scope === 'reported'
       ? 'created'
@@ -692,28 +813,48 @@ async function fetchLinearTasksWithHierarchy(
           ? 'all'
           : 'assigned'
 
-  let linAns: CliResult | null = null
-  if (scope === 'assigned' || scope === 'all') {
+  let linAns: Record<string, unknown> | null = null
+  if (scope === 'assigned' || scope === 'all' || scope === 'sprint') {
     const args = ['linear', 'list-issues']
-    if (scope === 'assigned') args.push('--assignee', 'me')
-    args.push('--limit', '50', '--workspace', 'all')
+    if (scope === 'assigned' || scope === 'sprint') args.push('--assignee', 'me')
+    if (scope === 'sprint') args.push('--cycle', 'active')
+    args.push('--limit', safeLimit, '--workspace', 'all')
     linAns = await runOrcaCli(args, signal)
   }
 
   if (linAns?.ok !== true || !linAns.result) {
     linAns = await runOrcaCli(
-      ['linear', 'list', '--filter', linearFilter, '--limit', '50', '--workspace', 'all'],
+      ['linear', 'list', '--filter', linearFilter, '--limit', safeLimit, '--workspace', 'all'],
       signal
     )
   }
 
   if (linAns?.ok !== true || !linAns.result) {
-    return { connected: false, items: [] }
+    return { connected: false, items: [], truncated: false, totalCount: null }
   }
 
+  const resObj =
+    linAns.result && typeof linAns.result === 'object' && !Array.isArray(linAns.result)
+      ? (linAns.result as Record<string, unknown>)
+      : null
+  const metaObj =
+    resObj?.meta && typeof resObj.meta === 'object'
+      ? (resObj.meta as Record<string, unknown>)
+      : null
   const items = parseLinearTasksResult(linAns.result)
+  const truncated =
+    Boolean(resObj?.truncated) ||
+    Boolean(metaObj?.hasMore) ||
+    items.length >= Number(safeLimit)
+  const totalCount =
+    typeof resObj?.total === 'number'
+      ? resObj.total
+      : typeof metaObj?.total === 'number'
+        ? metaObj.total
+        : null
+
   if (items.length === 0) {
-    return { connected: true, items }
+    return { connected: true, items, truncated: false, totalCount: 0 }
   }
 
   // Prioritize active/backlog items when hydrating full context + child subtasks
@@ -761,7 +902,7 @@ async function fetchLinearTasksWithHierarchy(
   }
 
   linkParentChildHierarchy(items)
-  return { connected: true, items }
+  return { connected: true, items, truncated, totalCount }
 }
 
 /**
@@ -807,25 +948,130 @@ function linkParentChildHierarchy(items: TaskItem[]): void {
   }
 }
 
+const DEFAULT_SPRINT_JQL =
+  'sprint in openSprints() AND assignee = currentUser() AND statusCategory != Done'
+
 /**
- * Fetches Jira issues for a site via `orca jira list` and hydrates full descriptions,
- * acceptance criteria, and parent/child relationships via `orca jira issue <key>`.
+ * Fetches Jira issues for a site via `orca jira list` (or `orca jira search` for `sprint` scope),
+ * detects silent credential failures via `orca jira project list` when 0 items return,
+ * and hydrates full descriptions, acceptance criteria, and parent/child relationships.
  */
 async function fetchJiraTasksWithHierarchy(
   siteId: string,
   scope: TaskScopeFilter,
-  signal?: AbortSignal
-): Promise<TaskItem[]> {
-  const jiraListAns = await runOrcaCli(
-    ['jira', 'list', '--site', siteId, '--filter', scope, '--limit', '50'],
-    signal
-  )
+  signal?: AbortSignal,
+  options?: { syncLimit?: number; sprintJql?: string }
+): Promise<{
+  items: TaskItem[]
+  unassignedSprintItems: TaskItem[]
+  truncated: boolean
+  totalCount: number | null
+  syncStatus: 'ok' | 'empty' | 'auth_warning'
+  authWarning: string | null
+}> {
+  const limitNum = Math.min(Math.max(options?.syncLimit ?? 100, 10), 500)
+  const safeLimit = String(limitNum)
+  const effectiveSprintJql =
+    options?.sprintJql && options.sprintJql.trim()
+      ? options.sprintJql.trim()
+      : DEFAULT_SPRINT_JQL
+
+  const jiraListAns =
+    scope === 'sprint'
+      ? await runOrcaCli(
+          ['jira', 'search', effectiveSprintJql, '--site', siteId, '--limit', safeLimit],
+          signal
+        )
+      : await runOrcaCli(
+          ['jira', 'list', '--site', siteId, '--filter', scope, '--limit', safeLimit],
+          signal
+        )
+
   if (jiraListAns?.ok !== true || !jiraListAns.result) {
-    return []
+    return {
+      items: [],
+      unassignedSprintItems: [],
+      truncated: false,
+      totalCount: null,
+      syncStatus: 'auth_warning',
+      authWarning:
+        'Jira returned no data: check your API token in Settings → Jira.'
+    }
   }
 
+  const resObj =
+    jiraListAns.result &&
+    typeof jiraListAns.result === 'object' &&
+    !Array.isArray(jiraListAns.result)
+      ? (jiraListAns.result as Record<string, unknown>)
+      : null
   const items = parseJiraTasksResult(jiraListAns.result, siteId)
-  if (items.length === 0) return items
+  const totalCount = typeof resObj?.total === 'number' ? resObj.total : null
+  const truncated =
+    Boolean(resObj?.truncated) ||
+    (totalCount !== null && totalCount > items.length) ||
+    items.length >= limitNum
+
+  let unassignedSprintItems: TaskItem[] = []
+  if (scope === 'sprint') {
+    const unassignedFromMain = items.filter(
+      (t) => !t.assignee || t.assignee.toLowerCase() === 'unassigned'
+    )
+    const unassignedAns = await runOrcaCli(
+      [
+        'jira',
+        'search',
+        'sprint in openSprints() AND assignee is EMPTY AND statusCategory != Done',
+        '--site',
+        siteId,
+        '--limit',
+        '25'
+      ],
+      signal
+    )
+    const extraUnassigned =
+      unassignedAns?.ok === true && unassignedAns.result
+        ? parseJiraTasksResult(unassignedAns.result, siteId)
+        : []
+    const byId = new Map<string, TaskItem>()
+    for (const u of [...unassignedFromMain, ...extraUnassigned]) {
+      byId.set(u.id, u)
+    }
+    unassignedSprintItems = Array.from(byId.values())
+  }
+
+  if (items.length === 0 && unassignedSprintItems.length === 0) {
+    // Item 2: Verify whether Jira credentials are actually alive via `orca jira project list`
+    const projAns = await runOrcaCli(['jira', 'project', 'list', '--site', siteId], signal)
+    const rawProjects = Array.isArray(projAns?.result)
+      ? projAns.result
+      : projAns?.result && typeof projAns.result === 'object'
+        ? Array.isArray((projAns.result as Record<string, unknown>).projects)
+          ? ((projAns.result as Record<string, unknown>).projects as unknown[])
+          : Array.isArray((projAns.result as Record<string, unknown>).items)
+            ? ((projAns.result as Record<string, unknown>).items as unknown[])
+            : []
+        : []
+    if (projAns?.ok !== true || rawProjects.length === 0) {
+      return {
+        items: [],
+        unassignedSprintItems: [],
+        truncated: false,
+        totalCount: 0,
+        syncStatus: 'auth_warning',
+        authWarning:
+          'Jira returned no data: check your API token in Settings → Jira.'
+      }
+    }
+    return {
+      items: [],
+      unassignedSprintItems: [],
+      truncated: false,
+      totalCount: 0,
+      syncStatus: 'empty',
+      authWarning: null
+    }
+  }
 
   const byKey = new Map(items.map((t) => [t.key, t]))
   const needDetails = [
@@ -865,12 +1111,22 @@ async function fetchJiraTasksWithHierarchy(
         if (!existing.parent && hydrated.parent) {
           existing.parent = hydrated.parent
         }
+        if (!existing.sprint && hydrated.sprint) {
+          existing.sprint = hydrated.sprint
+        }
       })
     )
   }
 
   linkParentChildHierarchy(items)
-  return items
+  return {
+    items,
+    unassignedSprintItems,
+    truncated,
+    totalCount,
+    syncStatus: 'ok',
+    authWarning: null
+  }
 }
 
 /**
@@ -1011,6 +1267,7 @@ export function parseJiraTasksResult(result: unknown, siteId?: string | null): T
     }
 
     const safeUrl = validateHttpsUrl(row.url)
+    const sprint = extractSprintInfo(row, 'jira')
 
     items.push({
       id: `jira:${key}`,
@@ -1030,6 +1287,7 @@ export function parseJiraTasksResult(result: unknown, siteId?: string | null): T
       reporter,
       parent,
       children,
+      ...(sprint ? { sprint } : {}),
       ...(safeUrl ? { url: safeUrl } : {}),
       ...(siteId ? { externalWorkspaceId: siteId } : {}),
       updatedAt: Date.now()
@@ -2573,6 +2831,106 @@ export function readAcVerdictFromWorkspace(
   }
 }
 
+/**
+ * Safely reads `.orca/task-bridge/proposed-ac-<KEY>.json` inside a workspace worktree,
+ * rejecting symlinks or path escapes and returning the sanitized list of proposed criteria.
+ */
+export function readProposedAcFromWorkspace(
+  workspacePath: string | null | undefined,
+  ticketKey: string
+): string[] {
+  const safeKey = validateTicketKey(ticketKey)
+  if (!safeKey || !workspacePath || workspacePath === '.' || !existsSync(workspacePath)) {
+    return []
+  }
+  const relPath = `.orca/task-bridge/proposed-ac-${safeKey}.json`
+  try {
+    const realRoot = realpathSync(workspacePath)
+    const targetPath = path.resolve(realRoot, relPath)
+    if (!isRealPathInsideRoot(realRoot, targetPath) || !existsSync(targetPath)) {
+      return []
+    }
+    const stat = lstatSync(targetPath)
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 64 * 1024) {
+      return []
+    }
+    const realTarget = realpathSync(targetPath)
+    if (!isRealPathInsideRoot(realRoot, realTarget)) {
+      return []
+    }
+    const parsed = JSON.parse(readFileSync(realTarget, 'utf8')) as Record<string, unknown>
+    const rawList = Array.isArray(parsed?.criteria)
+      ? parsed.criteria
+      : Array.isArray(parsed?.acceptanceCriteria)
+        ? parsed.acceptanceCriteria
+        : []
+    return rawList
+      .filter((item): item is string => typeof item === 'string')
+      .map((item) => sanitizeUntrustedText(item.replace(/^[-*[\]\d.)\s]+/, ''), 240))
+      .filter(Boolean)
+      .slice(0, 12)
+  } catch {
+    return []
+  }
+}
+
+async function postTaskCommentOnProvider(options: {
+  task: TaskItem
+  commentBody: string
+  notionToken?: string | null
+  selectedJiraSiteId?: string | null
+  signal?: AbortSignal
+}): Promise<boolean> {
+  const { task, commentBody, notionToken, selectedJiraSiteId, signal } = options
+  if (task.demo) return false
+  const safeKey = validateTicketKey(task.key)
+  const cleanBody = sanitizeUntrustedText(commentBody, 2000)
+  if (!safeKey || !cleanBody) return false
+
+  if (task.provider === 'jira') {
+    const siteId = task.externalWorkspaceId || selectedJiraSiteId || null
+    const siteArgs = siteId ? ['--site', siteId] : []
+    const ans = await runOrcaCli(
+      ['jira', 'comment', 'add', safeKey, '--body', cleanBody, ...siteArgs],
+      signal
+    )
+    return ans?.ok === true
+  }
+
+  if (task.provider === 'linear') {
+    const ans = await runOrcaCli(
+      ['linear', 'comment', 'add', safeKey, '--body', cleanBody],
+      signal
+    )
+    return ans?.ok === true
+  }
+
+  if (task.provider === 'notion' && task.externalWorkspaceId && notionToken && typeof fetch === 'function') {
+    const safePageId = validateNotionId(task.externalWorkspaceId)
+    if (!safePageId) return false
+    try {
+      const res = await fetch('https://api.notion.com/v1/comments', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${notionToken.trim()}`,
+          'Notion-Version': '2022-06-28',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          parent: { page_id: safePageId },
+          rich_text: [{ type: 'text', text: { content: cleanBody } }]
+        }),
+        signal
+      })
+      return res.ok
+    } catch {
+      return false
+    }
+  }
+
+  return false
+}
+
 export default function activate(orca: OrcaWorkerApi): void {
   // In-memory demo tasks (never persisted to `orca.storage` so demo data never pollutes real queues)
   let inMemoryDemoTasks: TaskItem[] = DEFAULT_SEED_TASKS.map((t) => ({
@@ -2586,6 +2944,7 @@ export default function activate(orca: OrcaWorkerApi): void {
   const taskByTerminalId = new Map<string, TaskItem>()
   const taskByWorkspaceId = new Map<string, TaskItem>()
   const acReviewerByTerminalId = new Map<string, TaskItem>()
+  const acProposerByTerminalId = new Map<string, TaskItem>()
   const activeDispatches = new Set<string>()
   let tasksMutexChain: Promise<void> = Promise.resolve()
 
@@ -2604,8 +2963,16 @@ export default function activate(orca: OrcaWorkerApi): void {
   let cachedSelectedJiraSiteId: string | null = null
   let cachedLinearConnected = false
   let lastWorkerError: string | null = null
+  let cachedJiraAuthWarning: string | null = null
+  let cachedJiraSyncStatus: 'ok' | 'empty' | 'auth_warning' = 'ok'
+  let cachedSyncTruncated = false
+  let cachedSyncTotalCount: number | null = null
+  let cachedUnassignedSprintTasks: TaskItem[] = []
+  let cachedJiraProjects: JiraProjectOption[] = []
+  let cachedJiraIssueTypesByProject: Record<string, JiraIssueTypeOption[]> = {}
   let cachedGuidelinesByRepoId = new Map<string, RepoGuidelines>()
-  let cachedRepoConfigsByRepoId = new Map<string, RepoConfigFile>()
+  let cachedRepoConfigsByRepoId = new Map<string, RepoConfigFile | null>()
+  let cachedRepoConfigMtimeByRepoId = new Map<string, number | null>()
   let cachedSetupHashesByRepoId = new Map<string, string>()
   let cachedDiscoveredSkillsByRepoId = new Map<string, DiscoveredSkill[]>()
   let cachedBranchConfig: BranchNamingConfig = {
@@ -2791,22 +3158,52 @@ export default function activate(orca: OrcaWorkerApi): void {
     await orca.storage.set(STORAGE_APPROVED_SETUP_HASHES_KEY, toStrictJsonValue(hashes))
   }
 
+  function getRepoConfigMtime(repoPath: string): number | null {
+    try {
+      const cfgFile = path.join(repoPath, '.task-bridge.json')
+      if (!existsSync(cfgFile)) return null
+      return lstatSync(cfgFile).mtimeMs
+    } catch {
+      return null
+    }
+  }
+
   function scanRepoConfigAndSkills(
     repoId: string | null,
-    repoPath: string | null | undefined
+    repoPath: string | null | undefined,
+    forceRescan = false
   ): {
     repoFile: RepoConfigFile | null
     setupCommandsHash: string | null
     skills: DiscoveredSkill[]
   } {
     if (!repoId || !repoPath || repoPath === '.' || !existsSync(repoPath)) {
+      if (repoId && !cachedRepoConfigsByRepoId.has(repoId)) {
+        cachedRepoConfigsByRepoId.set(repoId, null)
+        cachedRepoConfigMtimeByRepoId.set(repoId, null)
+      }
       return {
         repoFile: repoId ? (cachedRepoConfigsByRepoId.get(repoId) ?? null) : null,
         setupCommandsHash: repoId ? (cachedSetupHashesByRepoId.get(repoId) ?? null) : null,
         skills: repoId ? (cachedDiscoveredSkillsByRepoId.get(repoId) ?? []) : []
       }
     }
+
+    const currentMtime = getRepoConfigMtime(repoPath)
+    if (
+      !forceRescan &&
+      cachedRepoConfigsByRepoId.has(repoId) &&
+      cachedRepoConfigMtimeByRepoId.get(repoId) === currentMtime
+    ) {
+      return {
+        repoFile: cachedRepoConfigsByRepoId.get(repoId) ?? null,
+        setupCommandsHash: cachedSetupHashesByRepoId.get(repoId) ?? null,
+        skills: cachedDiscoveredSkillsByRepoId.get(repoId) ?? []
+      }
+    }
+
     const loadedCfg = readRepoConfigFile(repoPath)
+    cachedRepoConfigMtimeByRepoId.set(repoId, currentMtime)
     if (loadedCfg) {
       cachedRepoConfigsByRepoId.set(repoId, loadedCfg.config)
       if (loadedCfg.setupCommandsHash) {
@@ -2814,13 +3211,16 @@ export default function activate(orca: OrcaWorkerApi): void {
       } else {
         cachedSetupHashesByRepoId.delete(repoId)
       }
+    } else {
+      // Cache negative result (null) so repos without `.task-bridge.json` are never re-scanned on every tool call (0.2.1 #1)
+      cachedRepoConfigsByRepoId.set(repoId, null)
+      cachedSetupHashesByRepoId.delete(repoId)
     }
     const skills = discoverRepoSkills(repoPath, loadedCfg?.config.skillDirs)
     cachedDiscoveredSkillsByRepoId.set(repoId, skills)
     return {
-      repoFile: loadedCfg?.config ?? cachedRepoConfigsByRepoId.get(repoId) ?? null,
-      setupCommandsHash:
-        loadedCfg?.setupCommandsHash ?? cachedSetupHashesByRepoId.get(repoId) ?? null,
+      repoFile: loadedCfg?.config ?? null,
+      setupCommandsHash: loadedCfg?.setupCommandsHash ?? null,
       skills
     }
   }
@@ -3005,6 +3405,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     taskByTerminalId.clear()
     taskByWorkspaceId.clear()
     acReviewerByTerminalId.clear()
+    acProposerByTerminalId.clear()
     for (const t of tasks) {
       if (t.linkedTerminalId) {
         taskByTerminalId.set(t.linkedTerminalId, t)
@@ -3018,6 +3419,9 @@ export default function activate(orca: OrcaWorkerApi): void {
       }
       if (t.acReviewerTerminalId) {
         acReviewerByTerminalId.set(t.acReviewerTerminalId, t)
+      }
+      if (t.acProposerTerminalId) {
+        acProposerByTerminalId.set(t.acProposerTerminalId, t)
       }
     }
   }
@@ -3202,6 +3606,23 @@ export default function activate(orca: OrcaWorkerApi): void {
       typeof raw.notionStatusProperty === 'string' && raw.notionStatusProperty.trim()
         ? sanitizeUntrustedText(raw.notionStatusProperty, 64)
         : 'Status'
+    const rawSyncLimit = Number(raw.syncLimit)
+    const syncLimit =
+      Number.isFinite(rawSyncLimit) && rawSyncLimit >= 10 && rawSyncLimit <= 500
+        ? Math.round(rawSyncLimit)
+        : 100
+    const sprintJql =
+      typeof raw.sprintJql === 'string' && raw.sprintJql.trim()
+        ? sanitizeUntrustedText(raw.sprintJql.trim(), 400)
+        : DEFAULT_SPRINT_JQL
+    const defaultJiraProject =
+      typeof raw.defaultJiraProject === 'string' && raw.defaultJiraProject.trim()
+        ? sanitizeUntrustedText(raw.defaultJiraProject.trim().toUpperCase(), 24)
+        : ''
+    const defaultJiraIssueType =
+      typeof raw.defaultJiraIssueType === 'string' && raw.defaultJiraIssueType.trim()
+        ? sanitizeUntrustedText(raw.defaultJiraIssueType.trim(), 40)
+        : ''
 
     cachedInjectSkill = injectCompletionSkill
     cachedBranchConfig = {
@@ -3226,7 +3647,11 @@ export default function activate(orca: OrcaWorkerApi): void {
       autoMoveInProgress,
       injectCompletionSkill,
       notionDatabaseId,
-      notionStatusProperty
+      notionStatusProperty,
+      syncLimit,
+      sprintJql,
+      defaultJiraProject,
+      defaultJiraIssueType
     }
   }
 
@@ -3270,16 +3695,25 @@ export default function activate(orca: OrcaWorkerApi): void {
   }
 
   async function buildState(): Promise<TaskBridgeState> {
-    const [{ tasks, isDemo }, scope, rawActiveId, rawLastSynced, cfg, notionToken, repoProfiles] =
-      await Promise.all([
-        readEffectiveTasks(),
-        readScope(),
-        orca.storage.get(STORAGE_ACTIVE_TASK_KEY),
-        orca.storage.get(STORAGE_LAST_SYNCED_KEY),
-        readSettings(),
-        orca.secrets.get(SECRET_NOTION_TOKEN),
-        readRepoProfiles()
-      ])
+    const [
+      { tasks, isDemo },
+      scope,
+      rawActiveId,
+      rawLastSynced,
+      rawLastSyncedWithData,
+      cfg,
+      notionToken,
+      repoProfiles
+    ] = await Promise.all([
+      readEffectiveTasks(),
+      readScope(),
+      orca.storage.get(STORAGE_ACTIVE_TASK_KEY),
+      orca.storage.get(STORAGE_LAST_SYNCED_KEY),
+      orca.storage.get(STORAGE_LAST_SYNCED_WITH_DATA_KEY),
+      readSettings(),
+      orca.secrets.get(SECRET_NOTION_TOKEN),
+      readRepoProfiles()
+    ])
 
     // Keep fast lookup maps synced with stored tasks across reloads
     taskByTerminalId.clear()
@@ -3418,8 +3852,11 @@ export default function activate(orca: OrcaWorkerApi): void {
     const scanTargets: Array<{ repoId: string; name: string; path: string }> = [
       ...availableRepos.map((r) => ({ repoId: r.repoId, name: r.name, path: r.path }))
     ]
-    if (activeRepoId && activeWs?.path && !scanTargets.some((t) => t.repoId === activeRepoId)) {
-      scanTargets.push({ repoId: activeRepoId, name: activeWs.name, path: activeWs.path })
+    for (const ws of workspaces) {
+      const wsRepoId = extractRepoId(ws.id) ?? ws.id
+      if (wsRepoId && ws.path && !scanTargets.some((t) => t.repoId === wsRepoId)) {
+        scanTargets.push({ repoId: wsRepoId, name: ws.name, path: ws.path })
+      }
     }
 
     for (const target of scanTargets) {
@@ -3535,6 +3972,12 @@ export default function activate(orca: OrcaWorkerApi): void {
     const usingDemoData =
       isDemo && !cachedLinearConnected && cachedJiraSites.length === 0 && !notionConfigured
 
+    const activeSprint =
+      [...tasks, ...cachedUnassignedSprintTasks].find((t) => Boolean(t.sprint))?.sprint ?? null
+    const cachedTasksMayBeStale =
+      !usingDemoData &&
+      (cachedJiraSyncStatus === 'auth_warning' || tasks.some((t) => Boolean(t.staleFromFailedSync)))
+
     return {
       tasks,
       fleet,
@@ -3572,6 +4015,21 @@ export default function activate(orca: OrcaWorkerApi): void {
       autoMoveInProgress: cfg.autoMoveInProgress,
       injectCompletionSkill: cfg.injectCompletionSkill,
       lastSyncedAt: typeof rawLastSynced === 'number' ? rawLastSynced : null,
+      lastSyncedWithDataAt:
+        typeof rawLastSyncedWithData === 'number' ? rawLastSyncedWithData : null,
+      jiraAuthWarning: cachedJiraAuthWarning,
+      jiraSyncStatus: cachedJiraSyncStatus,
+      cachedTasksMayBeStale,
+      syncLimit: cfg.syncLimit,
+      syncTruncated: cachedSyncTruncated,
+      syncTotalCount: cachedSyncTotalCount,
+      sprintJql: cfg.sprintJql,
+      activeSprint,
+      unassignedSprintTasks: cachedUnassignedSprintTasks,
+      defaultJiraProject: cfg.defaultJiraProject,
+      defaultJiraIssueType: cfg.defaultJiraIssueType,
+      jiraProjects: cachedJiraProjects,
+      jiraIssueTypesByProject: cachedJiraIssueTypesByProject,
       diagnosticsReport: buildDiagnosticsReport({
         linearConnected: cachedLinearConnected,
         jiraSiteCount: cachedJiraSites.length,
@@ -4481,8 +4939,10 @@ export default function activate(orca: OrcaWorkerApi): void {
     ])
 
     const importedItems: TaskItem[] = []
+    let nextSyncTruncated = false
+    let nextSyncTotalCount: number | null = null
 
-    // 1. Discover connected Jira sites AND fetch Jira issues via `orca jira list` (Fixes Bug #1)
+    // 1. Discover connected Jira sites AND fetch Jira issues via `orca jira list` / `orca jira search`
     if (providerFilter === 'all' || providerFilter === 'jira') {
       const connAns = await runOrcaCli(['jira', 'connection'], signal)
       if (connAns?.ok === true && connAns.result && typeof connAns.result === 'object') {
@@ -4510,27 +4970,44 @@ export default function activate(orca: OrcaWorkerApi): void {
       }
 
       if (cachedSelectedJiraSiteId) {
-        const jiraItems = await fetchJiraTasksWithHierarchy(
+        const jiraRes = await fetchJiraTasksWithHierarchy(
           cachedSelectedJiraSiteId,
           scope,
-          signal
+          signal,
+          { syncLimit: cfg.syncLimit, sprintJql: cfg.sprintJql }
         )
-        importedItems.push(...jiraItems)
+        importedItems.push(...jiraRes.items)
+        cachedJiraSyncStatus = jiraRes.syncStatus
+        cachedJiraAuthWarning = jiraRes.authWarning
+        if (scope === 'sprint') {
+          cachedUnassignedSprintTasks = jiraRes.unassignedSprintItems
+        } else {
+          cachedUnassignedSprintTasks = []
+        }
+        if (jiraRes.truncated) nextSyncTruncated = true
+        if (typeof jiraRes.totalCount === 'number') {
+          nextSyncTotalCount = (nextSyncTotalCount ?? 0) + jiraRes.totalCount
+        }
       }
     }
 
     // 2. Fetch Linear issues via `list-issues` / `list` and hydrate child hierarchy & ACs
     if (providerFilter === 'all' || providerFilter === 'linear') {
-      const linearRes = await fetchLinearTasksWithHierarchy(scope, signal)
+      const linearRes = await fetchLinearTasksWithHierarchy(scope, signal, cfg.syncLimit)
       if (linearRes.connected) {
         cachedLinearConnected = true
         importedItems.push(...linearRes.items)
+        if (linearRes.truncated) nextSyncTruncated = true
+        if (typeof linearRes.totalCount === 'number') {
+          nextSyncTotalCount = (nextSyncTotalCount ?? 0) + linearRes.totalCount
+        }
       }
     }
 
-    // 3. Sync from Notion REST API when token and validated database ID are configured
+    // 3. Sync from Notion REST API when token and validated database ID are configured (skip for Sprint scope)
     let notionSyncError: string | null = null
     if (
+      scope !== 'sprint' &&
       (providerFilter === 'all' || providerFilter === 'notion') &&
       notionToken &&
       cfg.notionDatabaseId
@@ -4553,7 +5030,14 @@ export default function activate(orca: OrcaWorkerApi): void {
         console.error(`[task-bridge] Notion sync exception: ${notionSyncError}`)
       }
     }
-    lastWorkerError = notionSyncError ? redactSecrets(sanitizeUntrustedText(notionSyncError, 200)) : null
+    cachedSyncTruncated = nextSyncTruncated
+    cachedSyncTotalCount = nextSyncTotalCount
+    lastWorkerError =
+      notionSyncError
+        ? redactSecrets(sanitizeUntrustedText(notionSyncError, 200))
+        : cachedJiraAuthWarning
+          ? redactSecrets(sanitizeUntrustedText(cachedJiraAuthWarning, 200))
+          : null
 
     // Merge imported tasks with latest stored tasks inside the lock so concurrent approvePlan/dispatch edits are never clobbered (F1)
     if (importedItems.length > 0) {
@@ -4573,6 +5057,7 @@ export default function activate(orca: OrcaWorkerApi): void {
           'acVerificationStatus',
           'acVerificationSummary',
           'acReviewerTerminalId',
+          'acProposerTerminalId',
           'repoId',
           'planApproved',
           'planLockActive',
@@ -4585,6 +5070,7 @@ export default function activate(orca: OrcaWorkerApi): void {
           const prev = mergedMap.get(item.id)
           if (prev) {
             const merged: Record<string, unknown> = { ...prev, ...item }
+            delete merged.staleFromFailedSync
             for (const field of preservedFields) {
               const val = prev[field] ?? item[field]
               if (val !== undefined) {
@@ -4599,6 +5085,18 @@ export default function activate(orca: OrcaWorkerApi): void {
           }
         }
         await saveEffectiveTasks(Array.from(mergedMap.values()), false)
+      })
+      await orca.storage.set(STORAGE_LAST_SYNCED_WITH_DATA_KEY, Date.now())
+    } else if (cachedJiraSyncStatus === 'auth_warning') {
+      // Mark stored Jira tickets as potentially stale when Jira returns 0 tickets & 0 projects (0.2.1 #2)
+      await withTasksLock(async () => {
+        const latestStored = await readStoredTasks()
+        if (latestStored.some((t) => t.provider === 'jira' && !t.staleFromFailedSync)) {
+          const marked = latestStored.map((t) =>
+            t.provider === 'jira' ? { ...t, staleFromFailedSync: true } : t
+          )
+          await saveEffectiveTasks(marked, false)
+        }
       })
     }
 
@@ -4685,9 +5183,11 @@ export default function activate(orca: OrcaWorkerApi): void {
       cfg.notionDatabaseId && (providerFilter === 'all' || providerFilter === 'notion')
         ? `Synced ${filteredCount} tasks across ${providerText} (Notion DB: ${cfg.notionDatabaseId.slice(0, 8)}…).`
         : `Synced ${filteredCount} tasks from ${providerText} (scope: ${scope}).`
-    const message = notionSyncError
-      ? `${baseMessage} Notion error: ${notionSyncError}`
-      : baseMessage
+    const message = cachedJiraAuthWarning
+      ? `${baseMessage} Warning: ${cachedJiraAuthWarning}`
+      : notionSyncError
+        ? `${baseMessage} Notion error: ${notionSyncError}`
+        : baseMessage
 
     return { state, syncedCount: filteredCount, message }
   }
@@ -4853,15 +5353,19 @@ export default function activate(orca: OrcaWorkerApi): void {
         }
 
         const state = await broadcastState()
+        const missingAcNotice =
+          existing.acceptanceCriteria.length === 0
+            ? ' (Note: ticket has no Acceptance Criteria defined — consider running Propose AC)'
+            : ''
         const summary = result.launchWarning
           ? result.launchWarning
           : result.launchUnconfirmed
             ? `Started [${result.updatedTask.key}] on branch ${result.branch} with ${result.agent}${
                 result.statusMoved ? ' and moved ticket to In Progress' : ''
-              } (Orca launch confirmation timed out; check workspace tab).`
+              } (Orca launch confirmation timed out; check workspace tab).${missingAcNotice}`
             : `Started [${result.updatedTask.key}] on branch ${result.branch} with ${result.agent}${
                 result.statusMoved ? ' and moved ticket to In Progress' : ''
-              }.`
+              }.${missingAcNotice}`
 
         return {
           state,
@@ -5670,6 +6174,544 @@ export default function activate(orca: OrcaWorkerApi): void {
     }
   )
 
+  // Item 6 (0.3.0): Propose Acceptance Criteria with a read-only analyst agent and post as a ticket comment
+  orca.panels.handle(
+    'tasks.proposeAcceptanceCriteria',
+    async (input: ProposeAcInput, { signal }): Promise<ProposeAcOutput> => {
+      const [{ tasks }, cfg, notionToken] = await Promise.all([
+        readEffectiveTasks(),
+        readSettings(),
+        orca.secrets.get(SECRET_NOTION_TOKEN)
+      ])
+      const task = tasks.find((t) => t.id === input.taskId)
+      if (!task) {
+        const err = new Error(`Task not found: ${input.taskId}`) as Error & { code: string }
+        err.code = 'invalid_params'
+        throw err
+      }
+
+      const branch = task.linkedBranch ?? buildBranchName(task, cachedBranchConfig)
+      const primaryAgent = task.dispatchedAgent ?? cfg.defaultAgent
+      const proposerAgent = selectAcReviewerAgent(
+        input.reviewerAgent,
+        primaryAgent,
+        detectAvailableAgentClis()
+      )
+      const prompt = buildProposeAcPrompt(task, branch)
+
+      let targetWorkspaceId = task.linkedOrcaWorkspaceId ?? null
+      let wsPath: string | null = null
+      try {
+        const wsRes = await orca.host.call('workspace.list')
+        const workspaces = Array.isArray(wsRes?.workspaces) ? wsRes.workspaces : []
+        const matched =
+          workspaces.find(
+            (w) =>
+              (targetWorkspaceId && w.id === targetWorkspaceId) ||
+              (task.linkedBranch && w.branch === task.linkedBranch)
+          ) ??
+          workspaces.find((w) => w.kind === 'worktree' && Boolean(w.branch && w.branch.trim())) ??
+          workspaces[0]
+        if (matched) {
+          if (!targetWorkspaceId) targetWorkspaceId = matched.id
+          wsPath = matched.path ?? null
+        }
+      } catch {
+        // Ignore
+      }
+
+      if (wsPath && wsPath !== '.' && existsSync(wsPath)) {
+        try {
+          const tbDir = path.join(wsPath, '.orca', 'task-bridge')
+          mkdirSync(tbDir, { recursive: true })
+          const gitignorePath = path.join(tbDir, '.gitignore')
+          if (!existsSync(gitignorePath)) {
+            writeFileSync(gitignorePath, '*\n', 'utf8')
+          }
+        } catch {
+          // Best-effort .gitignore setup
+        }
+      }
+
+      let proposerTerminalId: string | undefined
+      if (targetWorkspaceId) {
+        const launchOutcome = await launchAgentWithFallback({
+          workspaceId: targetWorkspaceId,
+          agent: proposerAgent,
+          prompt,
+          useCliLaunch: !process.env.NODE_TEST_CONTEXT || forceCliLaunchForTests,
+          signal
+        })
+        if (launchOutcome.warning) {
+          const err = new Error(
+            `Failed to launch "${proposerAgent}" AC proposer: ${launchOutcome.warning}`
+          ) as Error & { code: string }
+          err.code = 'action_failed'
+          throw err
+        }
+        proposerTerminalId = launchOutcome.terminalId
+      }
+
+      // If a proposed-ac file is already present on disk (or generated synchronously), post comment immediately
+      const immediateProposed = readProposedAcFromWorkspace(wsPath, task.key)
+      let commentPosted = false
+      if (immediateProposed.length > 0) {
+        const commentBody = [
+          `Proposed Acceptance Criteria for [${task.key}]:`,
+          ...immediateProposed.map((c) => `- [ ] ${c}`)
+        ].join('\n')
+        commentPosted = await postTaskCommentOnProvider({
+          task,
+          commentBody,
+          notionToken,
+          selectedJiraSiteId: cachedSelectedJiraSiteId,
+          signal
+        })
+      }
+
+      const updatedTask =
+        (await patchTaskLocked(task.id, (current) => ({
+          ...current,
+          ...(immediateProposed.length > 0 ? { acceptanceCriteria: immediateProposed } : {}),
+          ...(proposerTerminalId ? { acProposerTerminalId: proposerTerminalId } : {}),
+          updatedAt: Date.now()
+        }))) ?? task
+
+      if (proposerTerminalId) {
+        acProposerByTerminalId.set(proposerTerminalId, updatedTask)
+      }
+
+      const state = await broadcastState()
+      return {
+        state,
+        proposedCriteria: immediateProposed,
+        commentPosted,
+        summary:
+          immediateProposed.length > 0
+            ? `Proposed ${immediateProposed.length} acceptance criteria for [${task.key}]${
+                commentPosted ? ' and posted as a ticket comment' : ''
+              }.`
+            : `Launched read-only AC Proposer agent (${proposerAgent}) for [${task.key}]. Criteria will be posted as a comment when the agent finishes.`
+      }
+    }
+  )
+
+  // Item 8 (0.3.0): Assign an unassigned sprint ticket to the current user via `orca jira assignee set`
+  orca.panels.handle(
+    'tasks.assignToMe',
+    async (input: AssignToMeInput, { signal }): Promise<AssignToMeOutput> => {
+      const { tasks } = await readEffectiveTasks()
+      const task =
+        tasks.find((t) => t.id === input.taskId) ??
+        cachedUnassignedSprintTasks.find((t) => t.id === input.taskId)
+      if (!task) {
+        const err = new Error(`Task not found: ${input.taskId}`) as Error & { code: string }
+        err.code = 'invalid_params'
+        throw err
+      }
+
+      const safeKey = validateTicketKey(task.key)
+      if (!safeKey) {
+        const err = new Error(`Invalid ticket key: ${task.key}`) as Error & { code: string }
+        err.code = 'invalid_params'
+        throw err
+      }
+
+      const siteId = task.externalWorkspaceId || cachedSelectedJiraSiteId || null
+      const siteEntry = siteId
+        ? cachedJiraSites.find((s) => s.id === siteId)
+        : cachedJiraSites[0]
+      const siteEmail = siteEntry?.email ?? ''
+      let resolvedAssigneeName = siteEmail || 'Assigned to me'
+      let assignedOnProvider = false
+
+      if (task.demo) {
+        assignedOnProvider = true
+      } else if (task.provider === 'jira') {
+        const siteArgs = siteId ? ['--site', siteId] : []
+        const listArgs = ['jira', 'assignee', 'list', safeKey]
+        if (siteEmail) listArgs.push('--query', siteEmail)
+        listArgs.push(...siteArgs)
+        const listAns = await runOrcaCli(listArgs, signal)
+        const rawUsers = Array.isArray(listAns?.result)
+          ? listAns.result
+          : listAns?.result && typeof listAns.result === 'object'
+            ? Array.isArray((listAns.result as Record<string, unknown>).users)
+              ? ((listAns.result as Record<string, unknown>).users as unknown[])
+              : Array.isArray((listAns.result as Record<string, unknown>).assignees)
+                ? ((listAns.result as Record<string, unknown>).assignees as unknown[])
+                : Array.isArray((listAns.result as Record<string, unknown>).items)
+                  ? ((listAns.result as Record<string, unknown>).items as unknown[])
+                  : []
+            : []
+
+        let accountId = ''
+        for (const u of rawUsers) {
+          if (!u || typeof u !== 'object') continue
+          const uObj = u as Record<string, unknown>
+          const candId = sanitizeUntrustedText(
+            String(uObj.accountId ?? uObj.id ?? ''),
+            120
+          )
+          if (!candId) continue
+          const candName = sanitizeUntrustedText(
+            String(uObj.displayName ?? uObj.name ?? uObj.emailAddress ?? uObj.email ?? ''),
+            80
+          )
+          const candEmail = String(uObj.emailAddress ?? uObj.email ?? '').toLowerCase()
+          if (!accountId || (siteEmail && candEmail === siteEmail.toLowerCase())) {
+            accountId = candId
+            if (candName) resolvedAssigneeName = candName
+            if (siteEmail && candEmail === siteEmail.toLowerCase()) break
+          }
+        }
+
+        if (accountId) {
+          const setAns = await runOrcaCli(
+            ['jira', 'assignee', 'set', safeKey, '--to-id', accountId, ...siteArgs],
+            signal
+          )
+          assignedOnProvider = setAns?.ok === true
+        }
+      } else if (task.provider === 'linear') {
+        const linAns = await runOrcaCli(
+          ['linear', 'save-issue', safeKey, '--assignee', 'me'],
+          signal
+        )
+        assignedOnProvider = linAns?.ok === true
+      }
+
+      if (assignedOnProvider) {
+        const updatedItem: TaskItem = {
+          ...task,
+          assignee: resolvedAssigneeName,
+          updatedAt: Date.now()
+        }
+        cachedUnassignedSprintTasks = cachedUnassignedSprintTasks.filter((t) => t.id !== task.id)
+        await withTasksLock(async () => {
+          const cur = await readEffectiveTasks()
+          const idx = cur.tasks.findIndex((t) => t.id === task.id)
+          const nextList =
+            idx !== -1
+              ? cur.tasks.map((t, i) => (i === idx ? updatedItem : t))
+              : [updatedItem, ...cur.tasks]
+          await saveEffectiveTasks(nextList, cur.isDemo)
+        })
+      }
+
+      const state = await broadcastState()
+      return {
+        state,
+        assigned: assignedOnProvider,
+        assignee: assignedOnProvider ? resolvedAssigneeName : task.assignee,
+        summary: assignedOnProvider
+          ? `Assigned [${task.key}] to ${resolvedAssigneeName}.`
+          : `Could not assign [${task.key}] on ${task.provider.toUpperCase()}. Verify assignee permissions.`
+      }
+    }
+  )
+
+  // Item 7 (0.3.0): Discover Jira projects & issue types for creating a ticket from an unlinked worktree
+  orca.panels.handle(
+    'tasks.discoverJiraMetadata',
+    async (
+      input: DiscoverJiraMetadataInput | undefined,
+      { signal }
+    ): Promise<DiscoverJiraMetadataOutput> => {
+      const siteId = cachedSelectedJiraSiteId
+      const siteArgs = siteId ? ['--site', siteId] : []
+
+      const projAns = await runOrcaCli(['jira', 'project', 'list', ...siteArgs], signal)
+      const rawProjects = Array.isArray(projAns?.result)
+        ? projAns.result
+        : projAns?.result && typeof projAns.result === 'object'
+          ? Array.isArray((projAns.result as Record<string, unknown>).projects)
+            ? ((projAns.result as Record<string, unknown>).projects as unknown[])
+            : Array.isArray((projAns.result as Record<string, unknown>).items)
+              ? ((projAns.result as Record<string, unknown>).items as unknown[])
+              : []
+          : []
+      const projects: JiraProjectOption[] = rawProjects
+        .filter((p): p is Record<string, unknown> => Boolean(p && typeof p === 'object'))
+        .map((p) => ({
+          id: sanitizeUntrustedText(String(p.id ?? p.key ?? ''), 60),
+          key: sanitizeUntrustedText(String(p.key ?? p.id ?? ''), 24).toUpperCase(),
+          name: sanitizeUntrustedText(String(p.name ?? p.key ?? ''), 80)
+        }))
+        .filter((p) => Boolean(p.key))
+
+      if (projects.length > 0) {
+        cachedJiraProjects = projects
+      }
+
+      const targetProjectKey = sanitizeUntrustedText(
+        String(input?.projectKey ?? projects[0]?.key ?? ''),
+        24
+      ).toUpperCase()
+      let issueTypes: JiraIssueTypeOption[] = []
+
+      if (targetProjectKey) {
+        const typesAns = await runOrcaCli(
+          ['jira', 'project', 'types', '--project', targetProjectKey, ...siteArgs],
+          signal
+        )
+        const rawTypes = Array.isArray(typesAns?.result)
+          ? typesAns.result
+          : typesAns?.result && typeof typesAns.result === 'object'
+            ? Array.isArray((typesAns.result as Record<string, unknown>).issueTypes)
+              ? ((typesAns.result as Record<string, unknown>).issueTypes as unknown[])
+              : Array.isArray((typesAns.result as Record<string, unknown>).types)
+                ? ((typesAns.result as Record<string, unknown>).types as unknown[])
+                : Array.isArray((typesAns.result as Record<string, unknown>).items)
+                  ? ((typesAns.result as Record<string, unknown>).items as unknown[])
+                  : []
+            : []
+        issueTypes = rawTypes
+          .filter((t): t is Record<string, unknown> => Boolean(t && typeof t === 'object'))
+          .map((t) => ({
+            id: sanitizeUntrustedText(String(t.id ?? ''), 40),
+            name: sanitizeUntrustedText(String(t.name ?? t.id ?? 'Task'), 60),
+            subtask: Boolean(t.subtask)
+          }))
+          .filter((t) => Boolean(t.id) && !t.subtask)
+        if (issueTypes.length > 0) {
+          cachedJiraIssueTypesByProject = {
+            ...cachedJiraIssueTypesByProject,
+            [targetProjectKey]: issueTypes
+          }
+        }
+      }
+
+      const state = await broadcastState()
+      return {
+        state,
+        projects: cachedJiraProjects,
+        issueTypes,
+        summary: `Loaded ${cachedJiraProjects.length} Jira project(s)${
+          targetProjectKey ? ` and ${issueTypes.length} issue type(s) for ${targetProjectKey}` : ''
+        }.`
+      }
+    }
+  )
+
+  // Item 7 (0.3.0): Create a Jira ticket from an active unlinked worktree's branch & recent commits
+  orca.panels.handle(
+    'tasks.createFromWorkspace',
+    async (
+      input: CreateFromWorkspaceInput,
+      { signal }
+    ): Promise<CreateFromWorkspaceOutput> => {
+      const cfg = await readSettings()
+      const projectKey = sanitizeUntrustedText(
+        input.projectKey || cfg.defaultJiraProject,
+        24
+      ).toUpperCase()
+      const issueTypeId = sanitizeUntrustedText(
+        input.issueTypeId || cfg.defaultJiraIssueType,
+        40
+      )
+      if (!projectKey || !issueTypeId) {
+        const err = new Error(
+          'Both a Jira Project Key and an Issue Type ID are required to create a ticket.'
+        ) as Error & { code: string }
+        err.code = 'invalid_params'
+        throw err
+      }
+
+      let activeBranch = ''
+      let activeWorkspaceName = ''
+      try {
+        const ctx = await orca.host.call('workspace.readContext')
+        if (ctx) {
+          activeBranch = ctx.branch ?? ''
+          activeWorkspaceName = ctx.displayName ?? ''
+        }
+      } catch {
+        // Ignore
+      }
+
+      let matchedWs: HostWorkspaceEntry | undefined
+      try {
+        const wsRes = await orca.host.call('workspace.list')
+        const workspaces = Array.isArray(wsRes?.workspaces) ? wsRes.workspaces : []
+        matchedWs =
+          workspaces.find(
+            (w) =>
+              (activeBranch && w.branch === activeBranch) ||
+              (activeWorkspaceName && w.name === activeWorkspaceName)
+          ) ??
+          workspaces.find((w) => w.kind === 'worktree' && Boolean(w.branch && w.branch.trim()))
+        if (!activeBranch && matchedWs?.branch) {
+          activeBranch = matchedWs.branch
+        }
+      } catch {
+        // Ignore
+      }
+
+      const cleanBranch = activeBranch.replace(/^refs\/heads\//, '')
+      const derivedTitleFromBranch = cleanBranch
+        .replace(/^(feat|feature|fix|bugfix|hotfix|chore|refactor|task)\//i, '')
+        .replace(/[-_/]+/g, ' ')
+        .trim()
+
+      let commitLines = ''
+      if (matchedWs?.path && matchedWs.path !== '.') {
+        const gitOut = await runRepoTool(
+          'git',
+          ['log', '-n', '5', '--oneline'],
+          matchedWs.path,
+          signal
+        )
+        if (gitOut) {
+          commitLines = sanitizeUntrustedText(gitOut, 800)
+        }
+      }
+
+      const finalTitle =
+        sanitizeUntrustedText(input.title ?? '', 200) ||
+        sanitizeUntrustedText(derivedTitleFromBranch, 200) ||
+        `Work on ${cleanBranch || 'active worktree'}`
+      const finalDescription =
+        sanitizeUntrustedText(input.description ?? '', 2500) ||
+        [
+          `Created from Orca worktree branch \`${cleanBranch || 'main'}\`.`,
+          commitLines ? `\nRecent commits:\n${commitLines}` : ''
+        ]
+          .filter(Boolean)
+          .join('\n')
+
+      const siteId = cachedSelectedJiraSiteId
+      const siteArgs = siteId ? ['--site', siteId] : []
+      const createArgs = [
+        'jira',
+        'create',
+        '--project',
+        projectKey,
+        '--type',
+        issueTypeId,
+        '--title',
+        finalTitle,
+        '--body',
+        finalDescription,
+        ...siteArgs
+      ]
+
+      const createAns = await runOrcaCli(createArgs, signal)
+      if (createAns?.ok !== true || !createAns.result) {
+        const errObj =
+          createAns?.error && typeof createAns.error === 'object'
+            ? (createAns.error as Record<string, unknown>)
+            : null
+        const errMsg = sanitizeUntrustedText(
+          String(errObj?.message ?? `Failed to create Jira ticket in project ${projectKey}.`),
+          240
+        )
+        const err = new Error(errMsg) as Error & { code: string }
+        err.code = 'action_failed'
+        throw err
+      }
+
+      const resObj =
+        typeof createAns.result === 'object' && !Array.isArray(createAns.result)
+          ? (createAns.result as Record<string, unknown>)
+          : null
+      const createdKey =
+        validateTicketKey(String(resObj?.key ?? '')) ?? `${projectKey}-1`
+      const createdUrl = validateHttpsUrl(typeof resObj?.url === 'string' ? resObj.url : undefined)
+
+      // Best-effort auto-assign to current user via `orca jira assignee list` + `orca jira assignee set`
+      const siteEntry = siteId
+        ? cachedJiraSites.find((s) => s.id === siteId)
+        : cachedJiraSites[0]
+      const siteEmail = siteEntry?.email ?? ''
+      let assigneeName = siteEmail || 'Assigned to me'
+
+      const assignListArgs = ['jira', 'assignee', 'list', createdKey]
+      if (siteEmail) assignListArgs.push('--query', siteEmail)
+      assignListArgs.push(...siteArgs)
+      const assignListAns = await runOrcaCli(assignListArgs, signal)
+      const rawUsers = Array.isArray(assignListAns?.result)
+        ? assignListAns.result
+        : assignListAns?.result && typeof assignListAns.result === 'object'
+          ? Array.isArray((assignListAns.result as Record<string, unknown>).users)
+            ? ((assignListAns.result as Record<string, unknown>).users as unknown[])
+            : []
+          : []
+      const firstUser = rawUsers.find(
+        (u): u is Record<string, unknown> =>
+          Boolean(u && typeof u === 'object' && ((u as Record<string, unknown>).accountId || (u as Record<string, unknown>).id))
+      )
+      if (firstUser) {
+        const accountId = sanitizeUntrustedText(
+          String(firstUser.accountId ?? firstUser.id ?? ''),
+          120
+        )
+        const displayName = sanitizeUntrustedText(
+          String(firstUser.displayName ?? firstUser.name ?? assigneeName),
+          80
+        )
+        if (accountId) {
+          await runOrcaCli(
+            ['jira', 'assignee', 'set', createdKey, '--to-id', accountId, ...siteArgs],
+            signal
+          )
+          if (displayName) assigneeName = displayName
+        }
+      }
+
+      const createdTask: TaskItem = {
+        id: `jira:${createdKey}`,
+        key: createdKey,
+        provider: 'jira',
+        project: projectKey,
+        issueType: 'Task',
+        title: finalTitle,
+        description: finalDescription,
+        acceptanceCriteria: extractAcceptanceCriteriaFromText(finalDescription),
+        subtasks: [],
+        status: 'In Progress',
+        statusCategory: 'in_progress',
+        priority: 'medium',
+        kind: mapIssueKind('Task', finalTitle),
+        assignee: assigneeName,
+        reporter: assigneeName,
+        parent: null,
+        children: [],
+        ...(createdUrl ? { url: createdUrl } : {}),
+        ...(siteId ? { externalWorkspaceId: siteId } : {}),
+        ...(cleanBranch ? { linkedBranch: cleanBranch } : {}),
+        ...(matchedWs?.id ? { linkedOrcaWorkspaceId: matchedWs.id } : {}),
+        ...(matchedWs?.id ? { repoId: extractRepoId(matchedWs.id) ?? matchedWs.id } : {}),
+        updatedAt: Date.now()
+      }
+
+      if (matchedWs?.id) {
+        try {
+          await orca.host.call('workspace.rename', {
+            workspaceId: matchedWs.id,
+            name: `${createdKey} · ${sanitizeUntrustedText(finalTitle, 44)}`
+          })
+        } catch {
+          // Ignore on older hosts
+        }
+      }
+
+      await withTasksLock(async () => {
+        const latestStored = await readStoredTasks()
+        const nextList = [createdTask, ...latestStored.filter((t) => t.id !== createdTask.id)]
+        await saveEffectiveTasks(nextList, false)
+      })
+      await orca.storage.set(STORAGE_ACTIVE_TASK_KEY, createdTask.id)
+
+      const state = await broadcastState()
+      return {
+        state,
+        created: createdTask,
+        summary: `Created [${createdKey}] "${finalTitle}" and linked it to worktree branch ${cleanBranch || 'current'}.`
+      }
+    }
+  )
+
   function clearTaskFleetLinks(task: TaskItem, matchedWsId?: string | null): TaskItem {
     if (task.linkedTerminalId) taskByTerminalId.delete(task.linkedTerminalId)
     if (task.linkedOrcaWorkspaceId) taskByWorkspaceId.delete(task.linkedOrcaWorkspaceId)
@@ -5887,18 +6929,76 @@ export default function activate(orca: OrcaWorkerApi): void {
     return `Task Bridge: ${res.summary}`
   })
 
-  // Workspace & Agent events
-  orca.events.on('workspace.changed', async () => {
-    await broadcastState()
+  let resolveInitialWorkspaceScan: (() => void) | null = null
+  const initialWorkspaceScanPromise = new Promise<void>((resolve) => {
+    resolveInitialWorkspaceScan = resolve
   })
 
-  // Fixes Bug #5 & F4: Match AC reviewer strictly by `terminalId`, parse `.orca/task-bridge/ac-<KEY>.json`, and patch tasks under mutex
+  // Workspace & Agent events
+  orca.events.on('workspace.changed', async () => {
+    // Invalidate `.task-bridge.json` mtime cache on workspace change so any config edit is re-scanned
+    cachedRepoConfigMtimeByRepoId.clear()
+    try {
+      await broadcastState()
+    } finally {
+      resolveInitialWorkspaceScan?.()
+      resolveInitialWorkspaceScan = null
+    }
+  })
+
+  // Fixes Bug #5 & F4: Match AC reviewer & AC proposer strictly by `terminalId`, parse verdict/criteria JSON, and patch tasks under mutex
   orca.events.on('agent.status.changed', async (payload) => {
     const rawPayload = payload as Record<string, unknown>
     const termId = typeof rawPayload.terminalId === 'string' ? rawPayload.terminalId : null
     const wsId = typeof rawPayload.workspaceId === 'string' ? rawPayload.workspaceId : null
 
     const { tasks } = await readEffectiveTasks()
+
+    // 0. Match read-only AC Proposer agent strictly by `acProposerTerminalId === termId` (Item 6)
+    const proposerIndex = termId
+      ? tasks.findIndex((t) => t.acProposerTerminalId === termId)
+      : -1
+    if (proposerIndex !== -1) {
+      const propTask = tasks[proposerIndex]
+      if (payload.state === 'done') {
+        let wsPath: string | null = null
+        try {
+          const wsRes = await orca.host.call('workspace.list')
+          const workspaces = Array.isArray(wsRes?.workspaces) ? wsRes.workspaces : []
+          const matchedWs =
+            workspaces.find(
+              (w) =>
+                (propTask.linkedOrcaWorkspaceId && w.id === propTask.linkedOrcaWorkspaceId) ||
+                (propTask.linkedBranch && w.branch === propTask.linkedBranch)
+            ) ?? workspaces[0]
+          wsPath = matchedWs?.path ?? null
+        } catch {
+          wsPath = null
+        }
+
+        const proposedCriteria = readProposedAcFromWorkspace(wsPath, propTask.key)
+        if (proposedCriteria.length > 0) {
+          const notionToken = await orca.secrets.get(SECRET_NOTION_TOKEN)
+          const commentBody = [
+            `Proposed Acceptance Criteria for [${propTask.key}]:`,
+            ...proposedCriteria.map((c) => `- [ ] ${c}`)
+          ].join('\n')
+          await postTaskCommentOnProvider({
+            task: propTask,
+            commentBody,
+            notionToken,
+            selectedJiraSiteId: cachedSelectedJiraSiteId
+          })
+          await patchTaskLocked(propTask.id, (current) => ({
+            ...current,
+            acceptanceCriteria: proposedCriteria,
+            updatedAt: Date.now()
+          }))
+        }
+        await broadcastState()
+      }
+      return
+    }
 
     // 1. Match secondary AC reviewer strictly by `acReviewerTerminalId === termId` (never fall back to workspaceId)
     const reviewerIndex = termId
@@ -5991,14 +7091,15 @@ export default function activate(orca: OrcaWorkerApi): void {
     await broadcastState()
   })
 
-  // Hydrate lookup maps from storage immediately on worker activation so hooks fail closed after restarts
-  const initLookupPromise = readStoredTasks()
-    .then((stored) => {
+  // Hydrate lookup maps and wait for initial workspace.changed replay scan so hooks have zero I/O (0.2.1 #1)
+  const initLookupPromise = Promise.all([
+    readStoredTasks().then((stored) => {
       if (stored.length > 0 && taskByTerminalId.size === 0 && taskByWorkspaceId.size === 0) {
         rebuildLookupMaps(stored)
       }
-    })
-    .catch(() => undefined)
+    }),
+    initialWorkspaceScanPromise
+  ]).catch(() => undefined)
 
   // Fixes Bug #5 & Bug #10: Correlate `agent.prompt.before` strictly by `terminalId`
   orca.hooks.on('agent.prompt.before', async (event, next) => {
@@ -6055,7 +7156,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     })
   })
 
-  // Optional Plan-First Execution Gate + Repo Git Write Guard + Read-Only AC Reviewer lock (S2, F4, N2)
+  // Optional Plan-First Execution Gate + Repo Git Write Guard + Read-Only AC Reviewer/Proposer lock (S2, F4, N2, 0.2.1 #1)
   orca.hooks.on('agent.tool.before', async (event) => {
     await initLookupPromise
 
@@ -6073,26 +7174,27 @@ export default function activate(orca: OrcaWorkerApi): void {
       }
     }
 
+    // AC Proposer terminals remain strictly read-only and may only write `.orca/task-bridge/proposed-ac-<KEY>.json` (0.3.0 #6)
+    const acProposerTask = event.terminalId ? acProposerByTerminalId.get(event.terminalId) : undefined
+    if (acProposerTask) {
+      if (
+        isPlanLockToolAllowed(event.agent, event.tool, event.input) ||
+        isProposedAcFileWrite(event.tool, event.input, acProposerTask.key)
+      ) {
+        return
+      }
+      return {
+        deny: `Task Bridge AC Proposer Guard: [${acProposerTask.key}] proposer terminal is read-only and may only inspect the repo or write .orca/task-bridge/proposed-ac-${acProposerTask.key}.json.`
+      }
+    }
+
     const matchedTask =
       (event.terminalId ? taskByTerminalId.get(event.terminalId) : undefined) ??
       (event.workspaceId ? taskByWorkspaceId.get(event.workspaceId) : undefined) ??
       null
 
-    // N2: Repository-level guard.denyGitWrites applies across ALL agents even when planLockActive is false
+    // N2 & 0.2.1 #1: Pure in-memory lookup for guard.denyGitWrites — zero I/O inside agent.tool.before
     const guardRepoId = extractRepoId(event.workspaceId) ?? matchedTask?.repoId ?? null
-    if (guardRepoId && !cachedRepoConfigsByRepoId.has(guardRepoId)) {
-      try {
-        const wsRes = await orca.host.call('workspace.list')
-        const wsMatch = Array.isArray(wsRes?.workspaces)
-          ? wsRes.workspaces.find((w) => (extractRepoId(w.id) ?? w.id) === guardRepoId)
-          : undefined
-        if (wsMatch?.path) {
-          scanRepoConfigAndSkills(guardRepoId, wsMatch.path)
-        }
-      } catch {
-        // Ignore best-effort lookup
-      }
-    }
     const deniedGitWrites = guardRepoId
       ? cachedRepoConfigsByRepoId.get(guardRepoId)?.guard?.denyGitWrites
       : undefined

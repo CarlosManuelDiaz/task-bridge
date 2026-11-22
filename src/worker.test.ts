@@ -3426,3 +3426,385 @@ test('N1, N2, N3, A6, A7: discovers SKILL.md safely, enforces guard.denyGitWrite
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('0.2.1 #1: agent.tool.before caches negative .task-bridge.json lookup and performs zero workspace.list calls across N consecutive hook invocations', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tb-021-hook-'))
+  try {
+    const repoNoConfig = path.join(root, 'repo-no-cfg')
+    mkdirSync(repoNoConfig, { recursive: true })
+
+    const workspaces = [
+      {
+        id: `repoNoCfg::${repoNoConfig}`,
+        kind: 'worktree' as const,
+        name: 'main',
+        path: repoNoConfig,
+        branch: 'main',
+        hostId: null
+      }
+    ]
+    const host = mockHost({
+      results: {
+        'workspace.readContext': { branch: 'main', displayName: 'main', terminals: [] },
+        'workspace.list': { workspaces, truncated: false },
+        'agent.launch': { terminalId: 'term-021' },
+        'workspace.rename': null,
+        'notifications.show': null
+      }
+    })
+
+    const worker = await mountWorker(main, { host })
+    try {
+      // Fire 10 consecutive tool calls in a repo WITHOUT .task-bridge.json
+      for (let i = 0; i < 10; i++) {
+        const res = await worker.hooks.fire('agent.tool.before', {
+          agent: 'claude',
+          workspaceId: `repoNoCfg::${repoNoConfig}`,
+          terminalId: 'term-021',
+          tool: 'Bash',
+          input: { command: 'git status' }
+        })
+        assert.equal(res.kind, 'continue')
+      }
+
+      // workspace.list must have been called at most ONCE (during worker activation), never inside the hook!
+      assert.ok(
+        host.callsOf('workspace.list').length <= 1,
+        `Expected at most 1 workspace.list call across 10 hook invocations, got ${host.callsOf('workspace.list').length}`
+      )
+
+      // Now add .task-bridge.json and fire workspace.changed -> cache invalidates and guard.denyGitWrites takes effect
+      writeFileSync(
+        path.join(repoNoConfig, '.task-bridge.json'),
+        JSON.stringify({ guard: { denyGitWrites: ['push'] } }),
+        'utf8'
+      )
+      await worker.emit('workspace.changed', {
+        context: { branch: 'main', displayName: 'main', terminals: [] }
+      })
+
+      const callsBeforeHook = host.callsOf('workspace.list').length
+      const deniedPush = await worker.hooks.fire('agent.tool.before', {
+        agent: 'claude',
+        workspaceId: `repoNoCfg::${repoNoConfig}`,
+        terminalId: 'term-021',
+        tool: 'Bash',
+        input: { command: 'git push origin main' }
+      })
+      assert.equal(deniedPush.kind, 'deny')
+      assert.equal(
+        host.callsOf('workspace.list').length,
+        callsBeforeHook,
+        'Hook must not call workspace.list after workspace.changed refresh'
+      )
+    } finally {
+      await worker.deactivate()
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('0.2.1 #2-#3 & 0.3.0 #4-#8: detects silent Jira auth failure, supports sprint scope/header, unassigned assignToMe, proposeAcceptanceCriteria comment, and createFromWorkspace', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tb-030-'))
+  try {
+    const repoDir = path.join(root, 'repo-sprint')
+    mkdirSync(repoDir, { recursive: true })
+
+    const workspaces = [
+      {
+        id: `repoSprint::${repoDir}`,
+        kind: 'worktree' as const,
+        name: 'feat/unlinked- memory-cache',
+        path: repoDir,
+        branch: 'feat/unlinked-memory-cache',
+        hostId: null
+      }
+    ]
+
+    const host = mockHost({
+      settings: {
+        syncLimit: '200',
+        sprintJql: 'project in (ENG, PLAT) AND sprint in openSprints()'
+      },
+      results: {
+        'workspace.readContext': {
+          branch: 'feat/unlinked-memory-cache',
+          displayName: 'feat/unlinked-memory-cache',
+          terminals: []
+        },
+        'workspace.list': { workspaces, truncated: false },
+        'agent.launch': { terminalId: 'term-proposer-1' },
+        'workspace.rename': null,
+        'notifications.show': null
+      }
+    })
+
+    let simulateExpiredToken = false
+    let availableProjects: Array<{ id: string; key: string; name: string }> = [
+      { id: '100', key: 'ENG', name: 'Engineering' }
+    ]
+    const postedComments: Array<{ key: string; body: string }> = []
+    const assignedIssues: Array<{ key: string; accountId: string }> = []
+    const searchCalls: string[][] = []
+
+    // Past date (overdue sprint) to verify overdue sprint header detection (#5)
+    const pastEndDate = new Date(Date.now() - 3 * 86_400_000).toISOString()
+    const startDate = new Date(Date.now() - 17 * 86_400_000).toISOString()
+
+    setCliRunnerForTests(async (args) => {
+      if (args[0] === 'jira' && args[1] === 'connection') {
+        return {
+          ok: true,
+          result: {
+            sites: [{ id: 's1', siteUrl: 'https://acme.atlassian.net', email: 'alex@acme.com' }],
+            selectedSiteId: 's1'
+          }
+        }
+      }
+      if (args[0] === 'jira' && args[1] === 'project' && args[2] === 'list') {
+        return {
+          ok: true,
+          result: simulateExpiredToken ? [] : availableProjects
+        }
+      }
+      if (args[0] === 'jira' && args[1] === 'project' && args[2] === 'types') {
+        return {
+          ok: true,
+          result: [
+            { id: '10001', name: 'Task', subtask: false },
+            { id: '10002', name: 'Sub-task', subtask: true }
+          ]
+        }
+      }
+      if (args[0] === 'jira' && args[1] === 'list') {
+        if (simulateExpiredToken) {
+          return { ok: true, result: [] }
+        }
+        return {
+          ok: true,
+          result: {
+            issues: [
+              {
+                key: 'ENG-701',
+                summary: 'Undefined ticket without AC',
+                description: '',
+                status: { name: 'To Do', categoryKey: 'new' },
+                project: { key: 'ENG' }
+              }
+            ],
+            total: 350,
+            truncated: true
+          }
+        }
+      }
+      if (args[0] === 'jira' && args[1] === 'search') {
+        searchCalls.push([...args])
+        const jql = args[2] ?? ''
+        if (jql.includes('assignee is EMPTY')) {
+          return {
+            ok: true,
+            result: [
+              {
+                key: 'ENG-702',
+                summary: 'Unassigned sprint task',
+                status: { name: 'To Do', categoryKey: 'new' },
+                project: { key: 'ENG' },
+                assignee: 'Unassigned',
+                sprint: {
+                  id: 'sp-42',
+                  name: 'Sprint 42',
+                  goal: 'Ship Sprint 0.3.0',
+                  state: 'active',
+                  startDate,
+                  endDate: pastEndDate
+                }
+              }
+            ]
+          }
+        }
+        return {
+          ok: true,
+          result: [
+            {
+              key: 'ENG-701',
+              summary: 'Undefined ticket without AC',
+              description: '',
+              status: { name: 'In Progress', categoryKey: 'indeterminate' },
+              project: { key: 'ENG' },
+              assignee: { displayName: 'Alex Rivera' },
+              sprint: {
+                id: 'sp-42',
+                name: 'Sprint 42',
+                goal: 'Ship Sprint 0.3.0',
+                state: 'active',
+                startDate,
+                endDate: pastEndDate
+              }
+            }
+          ]
+        }
+      }
+      if (args[0] === 'jira' && args[1] === 'assignee' && args[2] === 'list') {
+        return {
+          ok: true,
+          result: [
+            { accountId: 'acc-alex-99', displayName: 'Alex Rivera', emailAddress: 'alex@acme.com' }
+          ]
+        }
+      }
+      if (args[0] === 'jira' && args[1] === 'assignee' && args[2] === 'set') {
+        const key = args[3] ?? ''
+        const toId = args[args.indexOf('--to-id') + 1] ?? ''
+        assignedIssues.push({ key, accountId: toId })
+        return { ok: true, result: {} }
+      }
+      if (args[0] === 'jira' && args[1] === 'comment' && args[2] === 'add') {
+        const key = args[3] ?? ''
+        const body = args[args.indexOf('--body') + 1] ?? ''
+        postedComments.push({ key, body })
+        return { ok: true, result: {} }
+      }
+      if (args[0] === 'jira' && args[1] === 'create') {
+        return {
+          ok: true,
+          result: {
+            key: 'ENG-799',
+            url: 'https://acme.atlassian.net/browse/ENG-799'
+          }
+        }
+      }
+      return { ok: true, result: {} }
+    })
+
+    setRepoToolRunnerForTests(async (exe, args) => {
+      if (exe === 'git' && args[0] === 'log') {
+        return 'a1b2c3d Add memory cache layer\ne4f5g6h Wire cache invalidation'
+      }
+      return null
+    })
+
+    const worker = await mountWorker(main, { host })
+    try {
+      // 1. Sync with valid token & custom syncLimit=200 + truncation indicator (#3)
+      const syncOk = await worker.request('tasks.sync', { provider: 'jira', scope: 'assigned' })
+      assert.equal(syncOk.state.jiraSyncStatus, 'ok')
+      assert.equal(syncOk.state.jiraAuthWarning, null)
+      assert.equal(syncOk.state.syncLimit, 200)
+      assert.equal(syncOk.state.syncTruncated, true)
+      assert.equal(syncOk.state.syncTotalCount, 350)
+      assert.ok(typeof syncOk.state.lastSyncedWithDataAt === 'number')
+
+      // 2. Simulate expired Jira token: 0 tickets AND 0 projects -> surfaces authWarning & marks stored tickets stale (#2)
+      simulateExpiredToken = true
+      const syncExpired = await worker.request('tasks.sync', { provider: 'jira', scope: 'assigned' })
+      assert.equal(syncExpired.state.jiraSyncStatus, 'auth_warning')
+      assert.match(String(syncExpired.state.jiraAuthWarning), /check your API token/)
+      assert.equal(syncExpired.state.cachedTasksMayBeStale, true)
+      assert.equal(syncExpired.state.tasks.find((t) => t.key === 'ENG-701')?.staleFromFailedSync, true)
+
+      // 2b. Valid token with 0 tickets but >=1 project -> syncStatus is 'empty', not 'auth_warning'
+      simulateExpiredToken = false
+      availableProjects = [{ id: '100', key: 'ENG', name: 'Engineering' }]
+
+      // 3. Sprint scope (#4) + Sprint Header with overdue warning (#5) + Unassigned in Sprint (#8)
+      const syncSprint = await worker.request('tasks.sync', { provider: 'jira', scope: 'sprint' })
+      assert.equal(syncSprint.state.scope, 'sprint')
+      assert.ok(
+        searchCalls.some(
+          (c) =>
+            c.includes('project in (ENG, PLAT) AND sprint in openSprints()') &&
+            c[c.indexOf('--limit') + 1] === '200'
+        )
+      )
+      assert.ok(syncSprint.state.activeSprint)
+      assert.equal(syncSprint.state.activeSprint?.name, 'Sprint 42')
+      assert.equal(syncSprint.state.activeSprint?.isOverdue, true)
+      assert.ok((syncSprint.state.activeSprint?.overdueDays ?? 0) >= 2)
+      assert.equal(syncSprint.state.unassignedSprintTasks?.length, 1)
+      assert.equal(syncSprint.state.unassignedSprintTasks?.[0]?.key, 'ENG-702')
+
+      // 4. Assign unassigned sprint ticket to me (#8)
+      const assignRes = await worker.request('tasks.assignToMe', { taskId: 'jira:ENG-702' })
+      assert.equal(assignRes.assigned, true)
+      assert.equal(assignRes.assignee, 'Alex Rivera')
+      assert.deepEqual(assignedIssues[0], { key: 'ENG-702', accountId: 'acc-alex-99' })
+      assert.equal(assignRes.state.unassignedSprintTasks?.length, 0)
+      assert.equal(assignRes.state.tasks.find((t) => t.key === 'ENG-702')?.assignee, 'Alex Rivera')
+
+      // 5. Propose Acceptance Criteria (#6): read-only proposer agent writes `.orca/task-bridge/proposed-ac-ENG-701.json` and posts comment
+      const proposeRes = await worker.request('tasks.proposeAcceptanceCriteria', {
+        taskId: 'jira:ENG-701',
+        reviewerAgent: 'claude'
+      })
+      assert.match(proposeRes.summary, /Launched read-only AC Proposer/)
+
+      // Verify proposer terminal is strictly read-only except for `.orca/task-bridge/proposed-ac-ENG-701.json`
+      const deniedSrcEdit = await worker.hooks.fire('agent.tool.before', {
+        agent: 'claude',
+        workspaceId: `repoSprint::${repoDir}`,
+        terminalId: 'term-proposer-1',
+        tool: 'Write',
+        input: { file_path: 'src/index.ts' }
+      })
+      assert.equal(deniedSrcEdit.kind, 'deny')
+
+      const allowedAcWrite = await worker.hooks.fire('agent.tool.before', {
+        agent: 'claude',
+        workspaceId: `repoSprint::${repoDir}`,
+        terminalId: 'term-proposer-1',
+        tool: 'Write',
+        input: { file_path: '.orca/task-bridge/proposed-ac-ENG-701.json' }
+      })
+      assert.equal(allowedAcWrite.kind, 'continue')
+
+      mkdirSync(path.join(repoDir, '.orca', 'task-bridge'), { recursive: true })
+      writeFileSync(
+        path.join(repoDir, '.orca', 'task-bridge', 'proposed-ac-ENG-701.json'),
+        JSON.stringify({
+          criteria: ['Cache hit returns within 5ms', 'Invalidation clears stale keys']
+        }),
+        'utf8'
+      )
+
+      await worker.emit('agent.status.changed', {
+        workspaceId: `repoSprint::${repoDir}`,
+        paneKey: 'pane-prop-1',
+        terminalId: 'term-proposer-1',
+        state: 'done',
+        receivedAt: Date.now()
+      })
+
+      assert.equal(postedComments.length, 1)
+      assert.equal(postedComments[0]?.key, 'ENG-701')
+      assert.match(postedComments[0]!.body, /Cache hit returns within 5ms/)
+      const stateAfterPropose = await worker.request('tasks.getState')
+      assert.deepEqual(
+        stateAfterPropose.tasks.find((t) => t.key === 'ENG-701')?.acceptanceCriteria,
+        ['Cache hit returns within 5ms', 'Invalidation clears stale keys']
+      )
+
+      // 6. Register unlinked worktree work (#7): discover metadata + create ticket from active branch & commits
+      const metaRes = await worker.request('tasks.discoverJiraMetadata', { projectKey: 'ENG' })
+      assert.equal(metaRes.projects.length, 1)
+      assert.equal(metaRes.issueTypes.length, 1)
+      assert.equal(metaRes.issueTypes[0]?.id, '10001')
+
+      const createdRes = await worker.request('tasks.createFromWorkspace', {
+        projectKey: 'ENG',
+        issueTypeId: '10001'
+      })
+      assert.equal(createdRes.created.key, 'ENG-799')
+      assert.equal(createdRes.created.title, 'unlinked memory cache')
+      assert.match(createdRes.created.description, /Add memory cache layer/)
+      assert.equal(createdRes.created.linkedBranch, 'feat/unlinked-memory-cache')
+      assert.equal(createdRes.state.activeTaskId, 'jira:ENG-799')
+    } finally {
+      setRepoToolRunnerForTests(null)
+      setCliRunnerForTests(null)
+      await worker.deactivate()
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})

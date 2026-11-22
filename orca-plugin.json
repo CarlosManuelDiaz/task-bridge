@@ -3,7 +3,7 @@
   "manifestVersion": 2,
   "id": "task-bridge",
   "name": "Task Bridge (Linear, Jira & Notion)",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "Carlos Manuel Díaz",
     "url": "https://github.com/CarlosManuelDiaz"
@@ -12,7 +12,7 @@
   "description": "Unified issue-to-worktree dispatcher for Linear, Jira, and Notion. Hydrates subtasks and Acceptance Criteria, auto-routes multi-repo workspaces via ticketPrefixes, reads CLAUDE.md/AGENTS.md guidelines, enforces Plan-First approval via tool hooks, monitors your In-Flight Fleet with Verify AC, In Review/Done transitions, comment feedback, and one-click Fleet/worktree cleanup.",
   "license": "MIT",
   "engines": {
-    "orca": ">=1.4.248"
+    "orca": ">=1.4.256"
   },
   "execution": "trusted-worker",
   "pluginApi": 1,
@@ -190,6 +190,44 @@
         "description": "Name of the Status or Select property in your Notion database.",
         "type": "string",
         "default": "Status"
+      },
+      {
+        "key": "syncLimit",
+        "title": "Ticket Sync Limit",
+        "description": "Maximum number of tickets to fetch per provider during sync.",
+        "type": "string",
+        "default": "100",
+        "enum": ["50", "100", "200", "500"],
+        "enumLabels": [
+          "50 tickets",
+          "100 tickets (default)",
+          "200 tickets",
+          "500 tickets"
+        ]
+      },
+      {
+        "key": "sprintJql",
+        "title": "Jira Sprint JQL",
+        "description": "Custom JQL used when the Sprint scope filter is active.",
+        "type": "string",
+        "default": "sprint in openSprints() AND assignee = currentUser() AND statusCategory != Done",
+        "placeholder": "sprint in openSprints() AND assignee = currentUser() AND statusCategory != Done"
+      },
+      {
+        "key": "defaultJiraProject",
+        "title": "Default Jira Project Key",
+        "description": "Optional default Jira project key when registering work from an unlinked worktree.",
+        "type": "string",
+        "default": "",
+        "placeholder": "e.g. ENG"
+      },
+      {
+        "key": "defaultJiraIssueType",
+        "title": "Default Jira Issue Type ID",
+        "description": "Optional default Jira issue type ID when creating a ticket from an unlinked worktree.",
+        "type": "string",
+        "default": "",
+        "placeholder": "e.g. 10001"
       }
     ]
   },

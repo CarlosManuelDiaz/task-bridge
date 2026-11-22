@@ -11,10 +11,42 @@ export type TaskProvider = 'linear' | 'jira' | 'notion'
 export type TaskStatusCategory = 'backlog' | 'todo' | 'in_progress' | 'in_review' | 'done'
 export type TaskPriority = 'urgent' | 'high' | 'medium' | 'low' | 'none'
 export type TaskKind = 'feature' | 'bug' | 'chore'
-export type TaskScopeFilter = 'assigned' | 'reported' | 'all' | 'done'
+export type TaskScopeFilter = 'assigned' | 'sprint' | 'reported' | 'all' | 'done'
 export type LiveAgentState = 'idle' | 'working' | 'waiting' | 'blocked' | 'done'
 export type AcVerificationStatus = 'unverified' | 'running' | 'verified' | 'failed' | 'unknown'
 export type PlanApprovalStatus = 'not_required' | 'awaiting_approval' | 'approved'
+
+export interface SprintInfo {
+  id?: string
+  name: string
+  goal?: string
+  state?: string
+  startDate?: string
+  endDate?: string
+  daysRemaining?: number | null
+  overdueDays?: number | null
+  isOverdue?: boolean
+  provider: 'jira' | 'linear'
+}
+
+export interface JiraProjectOption {
+  id: string
+  key: string
+  name: string
+}
+
+export interface JiraIssueTypeOption {
+  id: string
+  name: string
+  subtask?: boolean
+}
+
+export interface LinkedWorkspaceInfo {
+  repoId: string
+  workspaceId: string
+  branch: string
+  terminalId?: string
+}
 
 export interface BranchTypeRule {
   prefix: string
@@ -173,6 +205,9 @@ export interface TaskItem {
   acVerificationStatus?: AcVerificationStatus
   acVerificationSummary?: string
   acReviewerTerminalId?: string
+  acProposerTerminalId?: string
+  sprint?: SprintInfo | null
+  staleFromFailedSync?: boolean
   repoId?: string
   linkedWorkspaces?: Array<{
     repoId: string
@@ -253,6 +288,20 @@ export interface TaskBridgeState {
   autoMoveInProgress: boolean
   injectCompletionSkill: boolean
   lastSyncedAt: number | null
+  lastSyncedWithDataAt?: number | null
+  jiraAuthWarning?: string | null
+  jiraSyncStatus?: 'ok' | 'empty' | 'auth_warning'
+  cachedTasksMayBeStale?: boolean
+  syncLimit?: number
+  syncTruncated?: boolean
+  syncTotalCount?: number | null
+  sprintJql?: string
+  activeSprint?: SprintInfo | null
+  unassignedSprintTasks?: TaskItem[]
+  defaultJiraProject?: string
+  defaultJiraIssueType?: string
+  jiraProjects?: JiraProjectOption[]
+  jiraIssueTypesByProject?: Record<string, JiraIssueTypeOption[]>
   diagnosticsReport?: string
 }
 
@@ -727,6 +776,113 @@ export function buildAcVerificationPrompt(task: TaskItem, branch: string): strin
   ].join('\n')
 }
 
+export interface ApproveRepoSetupInput {
+  repoId: string
+  configHash: string
+}
+
+export interface ApproveRepoSetupOutput {
+  state: TaskBridgeState
+  approved: boolean
+  summary: string
+}
+
+export interface SendPrFeedbackInput {
+  taskId: string
+  customInstruction?: string
+  confirmNewSession?: boolean
+}
+
+export interface SendPrFeedbackOutput {
+  state: TaskBridgeState
+  summary: string
+}
+
+export interface ProposeAcInput {
+  taskId: string
+  reviewerAgent?: string
+}
+
+export interface ProposeAcOutput {
+  state: TaskBridgeState
+  proposedCriteria: string[]
+  commentPosted: boolean
+  summary: string
+}
+
+export interface AssignToMeInput {
+  taskId: string
+}
+
+export interface AssignToMeOutput {
+  state: TaskBridgeState
+  assigned: boolean
+  assignee: string
+  summary: string
+}
+
+export interface DiscoverJiraMetadataInput {
+  projectKey?: string
+}
+
+export interface DiscoverJiraMetadataOutput {
+  state: TaskBridgeState
+  projects: JiraProjectOption[]
+  issueTypes: JiraIssueTypeOption[]
+  summary: string
+}
+
+export interface CreateFromWorkspaceInput {
+  projectKey: string
+  issueTypeId: string
+  title?: string
+  description?: string
+  addToActiveSprint?: boolean
+}
+
+export interface CreateFromWorkspaceOutput {
+  state: TaskBridgeState
+  created: TaskItem
+  summary: string
+}
+
+/**
+ * Builds a read-only prompt that drafts Acceptance Criteria from the ticket and codebase
+ * and posts or writes them for a ticket comment without modifying the ticket description.
+ */
+export function buildProposeAcPrompt(task: TaskItem, branch: string): string {
+  const safeKey = validateTicketKey(task.key) ?? 'TASK-1'
+  const safeTitle = sanitizeUntrustedText(task.title, 200)
+  const safeDesc = sanitizeUntrustedText(task.description || '(No description provided)', 2000)
+  const safeBranch = validateBranchName(branch) ?? 'main'
+
+  return [
+    `# Propose Acceptance Criteria: [${safeKey}]`,
+    '',
+    `You are acting as a read-only **Product & Engineering Analyst** for branch \`${safeBranch}\`.`,
+    'Do NOT modify production or test source files, and do NOT modify the ticket description.',
+    'Inspect the relevant files in the repository to understand the implementation surface, then draft 3–6 concrete, testable Acceptance Criteria for this ticket.',
+    '',
+    '<untrusted_ticket_data>',
+    `## Ticket: ${safeTitle}`,
+    '## Current Description',
+    safeDesc,
+    '</untrusted_ticket_data>',
+    '',
+    '## Required Output',
+    `1. Write a JSON file to \`.orca/task-bridge/proposed-ac-${safeKey}.json\` with this exact structure:`,
+    '```json',
+    '{',
+    '  "criteria": [',
+    '    "First concrete, testable acceptance criterion",',
+    '    "Second concrete, testable acceptance criterion"',
+    '  ]',
+    '}',
+    '```',
+    '2. Task Bridge will automatically post your proposed Acceptance Criteria as a comment on the ticket without altering the original ticket description.'
+  ].join('\n')
+}
+
 declare module 'orca' {
   interface PluginRequests {
     'tasks.getState': { output: TaskBridgeState }
@@ -795,12 +951,28 @@ declare module 'orca' {
       output: { state: TaskBridgeState; task: TaskItem; providerSynced: boolean; summary: string }
     }
     'tasks.approveRepoSetup': {
-      input: { repoId: string; configHash: string }
-      output: { state: TaskBridgeState; summary: string }
+      input: ApproveRepoSetupInput
+      output: ApproveRepoSetupOutput
     }
     'tasks.sendPrFeedback': {
-      input: { taskId: string; customInstruction?: string; confirmNewSession?: boolean }
-      output: { state: TaskBridgeState; summary: string }
+      input: SendPrFeedbackInput
+      output: SendPrFeedbackOutput
+    }
+    'tasks.proposeAcceptanceCriteria': {
+      input: ProposeAcInput
+      output: ProposeAcOutput
+    }
+    'tasks.assignToMe': {
+      input: AssignToMeInput
+      output: AssignToMeOutput
+    }
+    'tasks.discoverJiraMetadata': {
+      input?: DiscoverJiraMetadataInput
+      output: DiscoverJiraMetadataOutput
+    }
+    'tasks.createFromWorkspace': {
+      input: CreateFromWorkspaceInput
+      output: CreateFromWorkspaceOutput
     }
     'tasks.delete': {
       input: { taskId: string }

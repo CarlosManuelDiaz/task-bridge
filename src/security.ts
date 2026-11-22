@@ -641,3 +641,34 @@ export function isAcReviewerVerdictWrite(
     rel.toLowerCase().endsWith(`/.orca/task-bridge/ac-${safeKey.toLowerCase()}.json`)
   )
 }
+
+/**
+ * Allows a read-only AC Proposer session to write ONLY its `.orca/task-bridge/proposed-ac-<KEY>.json` file.
+ */
+export function isProposedAcFileWrite(
+  toolName: string,
+  input: unknown,
+  expectedTicketKey: string
+): boolean {
+  if (!AC_VERDICT_WRITE_TOOLS.has(toolName.trim().toLowerCase())) return false
+  if (!input || typeof input !== 'object') return false
+  const obj = input as Record<string, unknown>
+  const rawPath =
+    typeof obj.file_path === 'string'
+      ? obj.file_path
+      : typeof obj.path === 'string'
+        ? obj.path
+        : typeof obj.TargetFile === 'string'
+          ? obj.TargetFile
+          : typeof obj.target_file === 'string'
+            ? obj.target_file
+            : ''
+  const rel = validateRelativeRepoPath(rawPath)
+  const safeKey = validateTicketKey(expectedTicketKey)
+  if (!rel || !safeKey) return false
+  return (
+    rel.toLowerCase() === `.orca/task-bridge/proposed-ac-${safeKey.toLowerCase()}.json` ||
+    rel.toLowerCase().endsWith(`/.orca/task-bridge/proposed-ac-${safeKey.toLowerCase()}.json`)
+  )
+}
+

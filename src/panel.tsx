@@ -116,7 +116,7 @@ const hydratedRepoKey = atom<string | null>(null)
 const prUrlInput = atom<string>('')
 const completionCommentInput = atom<string>('')
 
-// Manual ticket form controls
+// Manual ticket form & unlinked worktree registration controls
 const newProvider = atom<TaskProvider>('linear')
 const newKind = atom<TaskKind>('feature')
 const newPriority = atom<TaskPriority>('medium')
@@ -125,6 +125,9 @@ const newTitle = atom<string>('')
 const newDescription = atom<string>('')
 const newCriteria = atom<string>('')
 const notionTokenInput = atom<string>('')
+const createWsProjectInput = atom<string>('')
+const createWsTypeInput = atom<string>('')
+const createWsTitleInput = atom<string>('')
 
 function getBranchNamingConfig(state: TaskBridgeState, repoId?: string) {
   const profile = repoId ? state.repoProfiles?.[repoId] : undefined
@@ -562,6 +565,78 @@ async function handleVerifyAc(taskId: string): Promise<void> {
   set(statusMessage, { text: res.summary, tone: 'success' })
 }
 
+async function handleProposeAc(taskId: string): Promise<void> {
+  try {
+    const reviewerChoice = read(selectedAcReviewerAgent)
+    const res = await plugin.request('tasks.proposeAcceptanceCriteria', {
+      taskId,
+      ...(reviewerChoice && reviewerChoice !== '__auto__' ? { reviewerAgent: reviewerChoice } : {})
+    })
+    applyIncomingState(res.state)
+    set(statusMessage, { text: res.summary, tone: 'success' })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
+}
+
+async function handleAssignToMe(taskId: string): Promise<void> {
+  try {
+    const res = await plugin.request('tasks.assignToMe', { taskId })
+    applyIncomingState(res.state)
+    set(statusMessage, {
+      text: res.summary,
+      tone: res.assigned ? 'success' : 'warning'
+    })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
+}
+
+async function handleDiscoverJiraMetadata(projectKey?: string): Promise<void> {
+  try {
+    const res = await plugin.request('tasks.discoverJiraMetadata', {
+      ...(projectKey ? { projectKey } : {})
+    })
+    applyIncomingState(res.state)
+    if (!read(createWsProjectInput) && res.projects[0]?.key) {
+      set(createWsProjectInput, res.projects[0].key)
+    }
+    if (!read(createWsTypeInput) && res.issueTypes[0]?.id) {
+      set(createWsTypeInput, res.issueTypes[0].id)
+    }
+    set(statusMessage, { text: res.summary, tone: 'accent' })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
+}
+
+async function handleCreateFromWorkspace(): Promise<void> {
+  const state = read(bridgeState)
+  const projectKey = (read(createWsProjectInput).trim() || state.defaultJiraProject || '').toUpperCase()
+  const issueTypeId = read(createWsTypeInput).trim() || state.defaultJiraIssueType || ''
+  if (!projectKey || !issueTypeId) {
+    set(statusMessage, {
+      text: 'Provide a Jira Project Key and Issue Type ID (or click Load Jira Projects & Types) before creating a ticket.',
+      tone: 'warning'
+    })
+    return
+  }
+  try {
+    const title = read(createWsTitleInput).trim()
+    const res = await plugin.request('tasks.createFromWorkspace', {
+      projectKey,
+      issueTypeId,
+      ...(title ? { title } : {})
+    })
+    set(createWsTitleInput, '')
+    applyIncomingState(res.state)
+    set(selectedTaskId, res.created.id)
+    set(statusMessage, { text: res.summary, tone: 'success' })
+  } catch (err) {
+    set(statusMessage, { text: formatActionError(err), tone: 'warning' })
+  }
+}
+
 async function handleTransition(
   taskId: string,
   targetCategory: TaskStatusCategory
@@ -793,6 +868,59 @@ export default function Panel() {
           </Row>
           <Badge tone={statusTone(activeTask.statusCategory)}>{activeTask.status}</Badge>
         </Box>
+      ) : state.activeBranch ? (
+        <Card
+          title={`Unlinked Worktree (${state.activeBranch.replace(/^refs\/heads\//, '')})`}
+          description="Register work in this active branch as a Jira ticket derived from the branch name and recent commits."
+        >
+          <Stack gap="xs">
+            <Row gap="xs">
+              <Input
+                label="Jira Project Key"
+                placeholder={state.defaultJiraProject || 'e.g. ENG'}
+                value={read(createWsProjectInput)}
+                onChange={(val) => set(createWsProjectInput, val)}
+              />
+              <Input
+                label="Issue Type ID"
+                placeholder={state.defaultJiraIssueType || 'e.g. 10001'}
+                value={read(createWsTypeInput)}
+                onChange={(val) => set(createWsTypeInput, val)}
+              />
+            </Row>
+            <Input
+              label="Optional Custom Ticket Title (leave blank to derive from branch & commits)"
+              placeholder="Auto-derived from branch slug and git log"
+              value={read(createWsTitleInput)}
+              onChange={(val) => set(createWsTitleInput, val)}
+            />
+            <Row gap="xs" wrap>
+              <Button
+                size="xs"
+                variant="solid"
+                tone="accent"
+                icon="add"
+                onPress={handleCreateFromWorkspace}
+              >
+                Create Ticket
+              </Button>
+              <Button
+                size="xs"
+                variant="outline"
+                icon="refresh"
+                onPress={() => handleDiscoverJiraMetadata(read(createWsProjectInput).trim() || undefined)}
+              >
+                Load Jira Projects & Types
+              </Button>
+            </Row>
+          </Stack>
+        </Card>
+      ) : null}
+
+      {state.jiraAuthWarning ? (
+        <Callout tone="warning" title="Jira Connection Warning">
+          <Text size="xs">{state.jiraAuthWarning}</Text>
+        </Callout>
       ) : null}
 
       {banner ? (
@@ -812,6 +940,7 @@ export default function Panel() {
               {(
                 [
                   { id: 'assigned', label: 'Assigned' },
+                  { id: 'sprint', label: 'Sprint' },
                   { id: 'reported', label: 'Reported' },
                   { id: 'all', label: 'All' },
                   { id: 'done', label: 'Done' }
@@ -828,6 +957,38 @@ export default function Panel() {
                 </Button>
               ))}
             </Row>
+
+            {state.scope === 'sprint' && filter === 'notion' ? (
+              <Callout tone="neutral" title="Sprint Scope Not Available for Notion">
+                <Text size="xs">
+                  Sprint / Cycle filtering applies to Jira Sprints and Linear Cycles. Switch Provider to All, Jira, or Linear.
+                </Text>
+              </Callout>
+            ) : null}
+
+            {state.scope === 'sprint' && state.activeSprint ? (
+              <Card
+                title={`Sprint: ${state.activeSprint.name}`}
+                description={state.activeSprint.goal || 'Active sprint / cycle'}
+              >
+                <Stack gap="xs">
+                  <Row gap="xs" wrap>
+                    <Badge tone={state.activeSprint.isOverdue ? 'warning' : 'accent'}>
+                      {state.activeSprint.isOverdue
+                        ? `Ended ${state.activeSprint.overdueDays ?? 1}d ago (still open)`
+                        : typeof state.activeSprint.daysRemaining === 'number'
+                          ? `${state.activeSprint.daysRemaining}d remaining`
+                          : state.activeSprint.state || 'Active'}
+                    </Badge>
+                    {state.activeSprint.startDate || state.activeSprint.endDate ? (
+                      <Text muted size="xs">
+                        {`${state.activeSprint.startDate?.slice(0, 10) ?? '—'} → ${state.activeSprint.endDate?.slice(0, 10) ?? '—'}`}
+                      </Text>
+                    ) : null}
+                  </Row>
+                </Stack>
+              </Card>
+            ) : null}
 
             <Row gap="xs">
               <Select
@@ -863,10 +1024,65 @@ export default function Panel() {
               onChange={(val) => set(searchQuery, val)}
             />
 
-            {state.lastSyncedAt ? (
-              <Text muted size="xs">
-                Last synced <RelativeTime at={state.lastSyncedAt} format="short" />
-              </Text>
+            {state.lastSyncedAt || state.lastSyncedWithDataAt || state.syncTruncated || state.cachedTasksMayBeStale ? (
+              <Row gap="xs" wrap align="center">
+                {state.lastSyncedWithDataAt ? (
+                  <Text muted size="xs">
+                    Last synced with data <RelativeTime at={state.lastSyncedWithDataAt} format="short" />
+                  </Text>
+                ) : state.lastSyncedAt ? (
+                  <Text muted size="xs">
+                    Last synced <RelativeTime at={state.lastSyncedAt} format="short" />
+                  </Text>
+                ) : null}
+                {state.cachedTasksMayBeStale ? (
+                  <Badge tone="warning">Cached (may be outdated)</Badge>
+                ) : null}
+                {state.syncTruncated ? (
+                  <Badge tone="neutral">
+                    {`Showing ${filteredTasks.length} of ${state.syncTotalCount ?? `${state.syncLimit ?? 100}+`}`}
+                  </Badge>
+                ) : null}
+              </Row>
+            ) : null}
+
+            {state.scope === 'sprint' && (state.unassignedSprintTasks?.length ?? 0) > 0 ? (
+              <Collapsible
+                title={`Unassigned in Sprint (${state.unassignedSprintTasks?.length ?? 0})`}
+                defaultOpen
+              >
+                <Stack gap="xs">
+                  {(state.unassignedSprintTasks ?? []).map((uTask) => (
+                    <Box
+                      key={uTask.id}
+                      direction="row"
+                      justify="between"
+                      align="center"
+                      padding="xs"
+                      border
+                      radius="sm"
+                    >
+                      <Stack gap="none">
+                        <Text size="xs" weight="medium">
+                          <Code>{uTask.key}</Code> {uTask.title}
+                        </Text>
+                        <Text muted size="xs">
+                          {`${uTask.status} · Unassigned`}
+                        </Text>
+                      </Stack>
+                      <Button
+                        size="xs"
+                        variant="outline"
+                        tone="accent"
+                        icon="check"
+                        onPress={() => handleAssignToMe(uTask.id)}
+                      >
+                        {`Assign to Me ${uTask.key}`}
+                      </Button>
+                    </Box>
+                  ))}
+                </Stack>
+              </Collapsible>
             ) : null}
 
             {!isLoaded && filteredTasks.length === 0 ? (
@@ -931,6 +1147,15 @@ export default function Panel() {
                           ) : null}
                           {(task.unreadCommentsCount ?? 0) > 0 ? (
                             <Badge tone="warning">{`${task.unreadCommentsCount} new comments`}</Badge>
+                          ) : null}
+                          {!task.description.trim() ? (
+                            <Badge tone="warning">No Description</Badge>
+                          ) : null}
+                          {task.acceptanceCriteria.length === 0 ? (
+                            <Badge tone="warning">Missing AC</Badge>
+                          ) : null}
+                          {task.staleFromFailedSync ? (
+                            <Badge tone="warning">Outdated</Badge>
                           ) : null}
                         </Row>
 
@@ -1318,6 +1543,29 @@ export default function Panel() {
                     Blocks Edit/Write and mutating Bash commands via agent.tool.before (enforced in Claude Code; other agents follow prompt Plan-First rules).
                   </Text>
 
+                  {!selectedTask.description.trim() || selectedTask.acceptanceCriteria.length === 0 ? (
+                    <Callout tone="warning" title="Ticket Needs Definition Before Dispatch">
+                      <Stack gap="xs">
+                        <Text size="xs">
+                          {!selectedTask.description.trim() && selectedTask.acceptanceCriteria.length === 0
+                            ? 'This ticket is missing both a description and Acceptance Criteria.'
+                            : !selectedTask.description.trim()
+                              ? 'This ticket has no description.'
+                              : 'This ticket has no Acceptance Criteria defined.'}
+                        </Text>
+                        <Button
+                          size="xs"
+                          variant="outline"
+                          tone="warning"
+                          icon="bot"
+                          onPress={() => handleProposeAc(selectedTask.id)}
+                        >
+                          Propose AC
+                        </Button>
+                      </Stack>
+                    </Callout>
+                  ) : null}
+
                   <Row gap="xs" wrap>
                     <Button
                       variant="solid"
@@ -1326,6 +1574,13 @@ export default function Panel() {
                       onPress={handleWorkbenchDispatch}
                     >
                       Launch Worktree & Agent
+                    </Button>
+                    <Button
+                      variant="outline"
+                      icon="bot"
+                      onPress={() => handleProposeAc(selectedTask.id)}
+                    >
+                      Propose AC
                     </Button>
                     {selectedTask.planLockActive && !selectedTask.planApproved ? (
                       <Button
