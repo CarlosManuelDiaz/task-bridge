@@ -1528,7 +1528,7 @@ export function selectAcReviewerAgent(
   if (requested && requested.trim()) {
     return validateAgentName(requested, primaryAgent)
   }
-  const priorityOrder = ['claude', 'codex', 'antigravity', 'cursor', 'gemini']
+  const priorityOrder = ['claude', 'codex', 'antigravity', 'cursor', 'gemini', 'copilot']
   const installedIds = new Set(availableAgents.filter((a) => a.cliFound).map((a) => a.id))
   if (installedIds.size > 0) {
     const distinct = priorityOrder.find((id) => id !== primaryAgent && installedIds.has(id))
@@ -2354,6 +2354,7 @@ const DEFAULT_SKILL_ROOTS = [
 const NATIVE_SKILL_DIRS_BY_AGENT: Record<string, readonly string[]> = {
   claude: ['.claude/skills', '.agents/skills'],
   codex: ['.codex/skills', '.agents/skills'],
+  copilot: ['.github/skills', '.agents/skills'],
   gemini: ['.gemini/skills', '.agents/skills'],
   cursor: ['.cursor/skills', '.agents/skills'],
   antigravity: ['.agents/skills', '.claude/skills', '.gemini/skills']
@@ -3285,6 +3286,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       { id: 'antigravity', label: 'Antigravity (agy)', cmd: 'agy' },
       { id: 'claude', label: 'Claude Code', cmd: 'claude' },
       { id: 'codex', label: 'Codex', cmd: 'codex' },
+      { id: 'copilot', label: 'GitHub Copilot', cmd: 'copilot' },
       { id: 'gemini', label: 'Gemini CLI', cmd: 'gemini' },
       { id: 'cursor', label: 'Cursor CLI', cmd: 'cursor' }
     ]

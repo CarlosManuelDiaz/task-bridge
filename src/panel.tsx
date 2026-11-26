@@ -57,6 +57,7 @@ const INITIAL_STATE: TaskBridgeState = {
     { id: 'antigravity', label: 'Antigravity (agy)', cliFound: true },
     { id: 'claude', label: 'Claude Code', cliFound: true },
     { id: 'codex', label: 'Codex', cliFound: true },
+    { id: 'copilot', label: 'GitHub Copilot', cliFound: true },
     { id: 'gemini', label: 'Gemini CLI', cliFound: true },
     { id: 'cursor', label: 'Cursor CLI', cliFound: true }
   ],

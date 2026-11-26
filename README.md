@@ -119,7 +119,7 @@ Task Bridge reuses Orca's native **Linear** and **Jira** integrations (no duplic
 
 ### 5. Target Repository Routing, Repo Guidelines & Setup File Copy
 - **Per-Ticket Target Repository & Prefix Auto-Matching (`tasks.assignRepo`)**: Choose which Orca-registered repository a ticket targets right in Workbench, bind ticket key prefixes (e.g., `LIN, ENG`) inside a repository profile (`ticketPrefixes`) for automatic prefix matching, and protect multi-repository workspaces from ambiguous dispatches until a target repo is confirmed.
-- **Coding Agent Auto-Detection & Antigravity (`agy`) Support**: Supports **Antigravity (`agy`)**, **Claude Code**, **Codex**, **Gemini CLI**, and **Cursor CLI**, automatically checking `PATH` availability (`cliFound`) and provisioning isolated Git worktrees + visible agent terminals across macOS, Linux, and Windows PowerShell.
+- **Coding Agent Auto-Detection**: Supports **Antigravity (`agy`)**, **Claude Code**, **Codex**, **GitHub Copilot CLI**, **Gemini CLI**, and **Cursor CLI**, automatically checking `PATH` availability (`cliFound`) and provisioning isolated Git worktrees + visible agent terminals across macOS, Linux, and Windows PowerShell.
 - **Automatic Repo Instruction Detection**: Scans the active repository for `CLAUDE.md`, `.claude/CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.github/copilot-instructions.md`, `.orca/instructions.md`, and `.github/pull_request_template.md`, injecting `<repository_guidelines>` with explicit rule precedence and Conventional Commit / PR template reminders.
 - **Custom Branch Templates & Per-Repo Profiles (`tasks.saveRepoProfile`)**: Configure custom prefixes (`feature`, `bugfix`, `chore`) and branch templates with `{prefix}`, `{key}`, `{KEY}`, `{slug}`, `{project}`, `{PROJECT}`, and `{type}` globally or per `repoId`, or click **Apply Detected Guidelines** to adopt conventions found in `CLAUDE.md`.
 - **Local Untracked Setup File Copying**: Safely copies local config files (e.g., `.env.local`, `.claude/settings.local.json`) from the primary worktree into newly created worktrees (`validateRelativeRepoPath` blocks `..` traversal, absolute paths, and `.git`; `copyLocalSetupFiles` refuses symlinks and sources that resolve outside the primary worktree).
@@ -140,7 +140,7 @@ Task Bridge is engineered from the ground up so it cannot compromise developer m
 2. **Strict Input & Identifier Validation (`src/security.ts`)**
    - **Ticket Keys**: Validated against `^[A-Z][A-Z0-9_]{0,11}-[A-Z0-9]{1,12}$` (`validateTicketKey`) before passing to any CLI command.
    - **Branch Slugs**: Validated against git-check-ref-format rules (`validateBranchName`), blocking `..`, `@{`, leading `-`, and control characters.
-   - **Agent Allowlist**: Only `antigravity`, `claude`, `codex`, `gemini`, and `cursor` are permitted (`validateAgentName`).
+   - **Agent Allowlist**: Only `antigravity`, `claude`, `codex`, `copilot`, `gemini`, and `cursor` are permitted (`validateAgentName`).
    - **HTTPS-Only URLs**: Ticket links and Pull Request URLs are parsed with `new URL()` and restricted to `https:` (`validateHttpsUrl`), preventing `javascript:`, `file:`, or `data:` URI injection.
 3. **Prompt Injection & Terminal Escape Defense**
    - **ANSI/OSC Escape Stripping**: `sanitizeUntrustedText()` strips all ANSI CSI sequences, OSC 8/52 clipboard/hyperlink escapes, BEL, and C0/C1 control characters from remote ticket payloads.

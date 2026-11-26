@@ -31,7 +31,7 @@ const SECRET_PATTERNS: readonly RegExp[] = [
   /\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b/gi
 ]
 
-const ALLOWED_AGENTS = new Set(['antigravity', 'claude', 'codex', 'gemini', 'cursor'])
+const ALLOWED_AGENTS = new Set(['antigravity', 'claude', 'codex', 'copilot', 'gemini', 'cursor'])
 const TICKET_KEY_REGEX = /^[A-Z][A-Z0-9_]{0,11}-[A-Z0-9]{1,12}$/
 const SAFE_BRANCH_REGEX = /^[A-Za-z0-9]+(?:[._/-][A-Za-z0-9]+)*$/
 const SAFE_PREFIX_REGEX = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,23}$/
