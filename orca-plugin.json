@@ -80,8 +80,8 @@
         "description": "Agent CLI to launch when dispatching a ticket into a worktree.",
         "type": "string",
         "default": "claude",
-        "enum": ["antigravity", "claude", "codex", "gemini", "cursor"],
-        "enumLabels": ["Antigravity (agy)", "Claude Code", "Codex", "Gemini CLI", "Cursor CLI"]
+        "enum": ["antigravity", "claude", "codex", "copilot", "gemini", "cursor"],
+        "enumLabels": ["Antigravity (agy)", "Claude Code", "Codex", "GitHub Copilot", "Gemini CLI", "Cursor CLI"]
       },
       {
         "key": "branchPrefixMode",

@@ -184,6 +184,7 @@ test('enforces strict security boundaries against command injection, ANSI escape
 
   assert.equal(validateAgentName('antigravity'), 'antigravity')
   assert.equal(validateAgentName('codex'), 'codex')
+  assert.equal(validateAgentName('copilot'), 'copilot')
   assert.equal(validateAgentName('claude && calc.exe', 'claude'), 'claude')
 
   assert.equal(validateBranchName('feat/lin-142-oauth'), 'feat/lin-142-oauth')
@@ -1074,8 +1075,9 @@ test('multi-repo routing guards ambiguity, supports per-ticket assignRepo, and a
       initialState.availableRepos.map((r) => r.name),
       ['frontend-app', 'backend-api']
     )
-    assert.equal(initialState.availableAgents.length, 5)
+    assert.equal(initialState.availableAgents.length, 6)
     assert.ok(initialState.availableAgents.some((a) => a.id === 'antigravity'))
+    assert.ok(initialState.availableAgents.some((a) => a.id === 'copilot'))
 
     // 1. Multiple Git repos open with no focus and no assignment => refuses ambiguous launch
     await assert.rejects(
@@ -1127,6 +1129,7 @@ test('multi-repo routing guards ambiguity, supports per-ticket assignRepo, and a
 test('uses --repo path:<path> --no-parent and --agent/--prompt on worktree create for identity:wt2 workspaces', async () => {
   let createdBranch: string | null = null
   const host = mockHost({
+    settings: { defaultAgent: 'copilot' },
     results: {
       'workspace.readContext': null,
       'workspace.list': () => ({
@@ -1208,6 +1211,8 @@ test('uses --repo path:<path> --no-parent and --agent/--prompt on worktree creat
 
   const worker = await mountWorker(main, { host })
   try {
+    const state = await worker.request('tasks.getState')
+    assert.equal(state.defaultAgent, 'copilot')
     // 1. Fresh worktree creation passes `--repo path:...`, `--no-parent`, `--agent antigravity`, `--prompt ...`
     const res1 = await worker.request('tasks.dispatch', {
       taskId: 'linear:LIN-142',
@@ -1235,12 +1240,11 @@ test('uses --repo path:<path> --no-parent and --agent/--prompt on worktree creat
     // 2. Re-dispatch on existing identity:wt2 worktree launches via `orca agent launch --focus`
     await worker.request('tasks.dispatch', {
       taskId: 'linear:LIN-142',
-      agent: 'antigravity',
       createWorktree: true
     })
     const agentLaunchCall = cliCalls.find((c) => c[0] === 'agent' && c[1] === 'launch')!
     assert.ok(agentLaunchCall)
-    assert.equal(agentLaunchCall[agentLaunchCall.indexOf('--agent') + 1], 'antigravity')
+    assert.equal(agentLaunchCall[agentLaunchCall.indexOf('--agent') + 1], 'copilot')
     assert.equal(
       agentLaunchCall[agentLaunchCall.indexOf('--worktree') + 1],
       'identity:wt2:local:99999999-aaaa-bbbb-cccc-111111111111'
@@ -1398,6 +1402,9 @@ test('selectAcReviewerAgent prefers installed CLI agents over missing ones', () 
   ]
   assert.equal(selectAcReviewerAgent(undefined, 'antigravity', antigravityAndClaude), 'claude')
   assert.equal(selectAcReviewerAgent('codex', 'antigravity', onlyAntigravity), 'codex')
+  const onlyCopilot = [{ id: 'copilot', label: 'GitHub Copilot', cliFound: true }]
+  assert.equal(selectAcReviewerAgent(undefined, 'claude', onlyCopilot), 'copilot')
+  assert.equal(selectAcReviewerAgent('copilot', 'claude', onlyCopilot), 'copilot')
 })
 
 test('hydrates Linear subtasks, parent back-links, and acceptance criteria via list-issues + issue --children', async () => {
